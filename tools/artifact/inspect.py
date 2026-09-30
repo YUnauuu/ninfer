@@ -1,4 +1,6 @@
-"""Inspect NInfer v3 configurations, objects, bindings and files without numerical libraries."""
+"""Inspect NInfer v3 configurations, objects, bindings and files without numerical libraries.
+    无需数值库即可检查 NInfer v3 的配置、对象、绑定和文件。
+"""
 
 from __future__ import annotations
 

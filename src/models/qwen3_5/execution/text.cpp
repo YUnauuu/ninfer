@@ -49,6 +49,15 @@
 #include <utility>
 #include <vector>
 
+// ============================================================================
+// models/qwen3_5/execution/text.cpp —— TextContext 的实现
+// ============================================================================
+//
+// 三条主线：**校验**集中在公开入口（批处理那几个 + prefill_chunk 重载），所以 attn_mix / gdn_mix /
+// run_layers 默认拿到合法输入；**active_* 的装卸**由 Scoped* 完成，内部层不接参数、回头读
+// active_*（为空时退回 io_）；**两相的分叉点集中在 gdn_mix**。
+// workspace 规矩：公开调用前后成对 work_.reset()，**张量引用的生命周期绝不能跨过一次 reset**。
+
 namespace ninfer::models::qwen3_5::execution {
 namespace {
 
@@ -66,6 +75,8 @@ void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stre
                                cudaMemcpyHostToDevice, stream));
 }
 
+// **剩下的高维必须是 1**——NInfer 张量恒为 4 维（ne[0..3]），只比对前几维会放过"其实是 [N,1] 而不是
+// [N]"；非连续张量则会让算子按线性内存算出错误结果。
 void require_tensor_shape(const Tensor& t, DType dtype, std::initializer_list<std::int32_t> shape,
                           const char* label) {
     if (t.dtype != dtype) { throw std::invalid_argument(std::string(label) + " dtype mismatch"); }
@@ -83,6 +94,7 @@ void require_tensor_shape(const Tensor& t, DType dtype, std::initializer_list<st
     if (t.data == nullptr) { throw std::invalid_argument(std::string(label) + " data is null"); }
 }
 
+// 与 require_tensor_shape 只差 ne[1] 是"不小于"而非"等于"：io_.logits 是常驻复用缓冲，只用前几列。
 void require_tensor_window(const Tensor& t, DType dtype, std::int32_t rows, std::int32_t cols,
                            const char* label) {
     if (cols <= 0) { throw std::invalid_argument(std::string(label) + " cols must be positive"); }
@@ -103,6 +115,9 @@ Tensor matrix_window(Tensor& t, std::int32_t cols) {
     }
     return t.slice(1, 0, cols);
 }
+
+// 三个 Scoped* 绑定器：两类卸载语义别混——ScopedPositions / ScopedEnvelope 析构时**置空**
+// （前提是进入作用域时槽位为空，嵌套会出错），ScopedValue 保存旧值再还原，可安全嵌套/重入。
 
 class ScopedPositions {
 public:
@@ -153,6 +168,10 @@ private:
 
 } // namespace
 
+// DFlashFeatureSink 的调用顺序固定：begin(x) → 每层一次 capture_layer → capture_positions →
+// consume_prefill_chunk。漏调任何一步都会被后面一步的一致性检查（captured_mask）抓到。
+
+// 这里决定"这轮走哪套形状"：prefill 取 value.ne[1] 个 token，批处理取 batch_width × batch_size（**含填充列**）。
 void DFlashFeatureSink::begin(const Tensor& value) {
     const bool prefill = features != nullptr && positions != nullptr && batch_features == nullptr;
     const bool batch   = batch_features != nullptr && batch_lanes != nullptr &&
@@ -167,6 +186,7 @@ void DFlashFeatureSink::begin(const Tensor& value) {
     }
 }
 
+// layers 没列出的层直接返回（不是错误）；目标缓冲第 0 维 = hidden_size × layers.size()，**要抓的层沿它拼接**。
 void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream_t stream) {
     const auto it = std::find(layers.begin(), layers.end(), layer);
     if (it == layers.end()) { return; }
@@ -179,6 +199,7 @@ void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream
         throw std::logic_error("DFlash feature capture shape is invalid");
     }
     if (batch_features != nullptr) {
+        // 目标是"按 lane 顺次拼接"的紧凑布局，不是原样的 [width, batch] 网格。
         Tensor source = value.view({value.ne[0], batch_width, batch_size});
         Tensor target =
             batch_features->slice(0, static_cast<std::int32_t>(index) * value.ne[0], value.ne[0]);
@@ -200,6 +221,7 @@ void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream
     captured_mask |= 1U << index;
 }
 
+// 确认**每一层都被抓到了**（captured_mask 全 1）；批处理分支的位置信息已在 scatter 里用掉。
 void DFlashFeatureSink::capture_positions(const Tensor& source, cudaStream_t stream) {
     const std::uint32_t complete_mask = layers.size() == 32 ? ~0U : ((1U << layers.size()) - 1U);
     if (captured_mask != complete_mask) {
@@ -221,6 +243,7 @@ void DFlashFeatureSink::capture_positions(const Tensor& source, cudaStream_t str
                                cudaMemcpyDeviceToDevice, stream));
 }
 
+// 切出来的是**视图**（不拷贝），调用方必须在回调里用掉或拷走——随后 prefill_impl 就会 work_.reset()。
 void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint) {
     if (!consume_prefill || tokens != active_tokens) {
         throw std::logic_error("DFlash prefill feature consumer is unavailable");
@@ -230,6 +253,7 @@ void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool rewrite_
     consume_prefill(feature_window, position_window, rewrite_checkpoint);
 }
 
+// 逐层的 BlockParameters 不缓存，由 run_layers 现取（只有引用）。
 TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weights,
                          WorkspaceArena& work, qwen3_5::PagedKVCacheView kv,
                          LinearAttentionStatePool& state, qwen3_5::RoundState& io,
@@ -266,6 +290,7 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
 
 TextContext::~TextContext() = default;
 
+// 两个槽位允许相同（就地更新）也允许不同（保留原状态回滚）；越界直接抛，免得进 kernel 变成越界访存。
 void TextContext::set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot) {
     if (source_slot < 0 || source_slot >= state_.slot_count() || destination_slot < 0 ||
         destination_slot >= state_.slot_count()) {
@@ -275,6 +300,8 @@ void TextContext::set_linear_state_slots(std::int32_t source_slot, std::int32_t 
     linear_state_destination_slot_ = destination_slot;
 }
 
+// 校验要求"两者同真同假"（异或写成）；且这个设置**有状态**，不像分界点那样自动复位，本轮结束后
+// 必须由调用方改回来。
 void TextContext::set_gdn_state_action(GdnStateAction action,
                                        const GdnReplayRecords* replay_records) {
     if ((action == GdnStateAction::RecordForReplay) != (replay_records != nullptr)) {
@@ -284,6 +311,13 @@ void TextContext::set_gdn_state_action(GdnStateAction action,
     replay_records_   = replay_records;
 }
 
+// ============================================================================
+// MTP（Multi-Token Prediction）塔
+// ============================================================================
+// MTP 塔 = "单层版"的文本塔。关键是输入怎么造：第 t 列要预测第 t+1 个 token，所以同时吃
+// **t+1 位置的 embedding** 与 **t 位置的目标模型 hidden**，各自过 RMSNorm 后拼接投影（mtp_pack_fc_input）。
+
+// input_embeddings 非空表示"embedding 已算好"（多模态路径必须先散射视觉 embedding），**跳过查表**。
 void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
                                    const Tensor* input_embeddings, Tensor& x, Tensor& ah) {
     cudaStream_t s     = ctx_.stream;
@@ -322,6 +356,8 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
     ops::rmsnorm(x, mtp_->input_norm, config_.rms_norm_eps, true, ah, s);
 }
 
+// 与主塔一层几乎一样，区别只有**一层**、KV 只用 mtp_kv_；批处理分支把 [.., T] view 成 [.., width, batch]，
+// valid 允许传空 Tensor{}（"整块都有效"）。gate 的 sigmoid_mul 是注意力输出的门控，别和 GDN 混淆。
 void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
                                    const Tensor& rope_positions,
                                    ops::CausalAttentionExecutionEnvelope envelope,
@@ -427,6 +463,9 @@ void TextContext::mtp_forward_core(const Tensor& ids, const Tensor& hidden, cons
     mtp_forward_tail(x, ah, positions, rope_positions, envelope, mtp_hidden);
 }
 
+// 分两段算，为省算力：第一段（bulk）对**整块 T 列**算 stem 和 k/v 投影并 append 进 MTP KV cache，故意
+// **不算** q/gate 与注意力输出（只有最后一列会被用到），final_chunk 要先拷出 x / ah 的最后一列（bulk 的
+// workspace 出作用域即回收）；第二段只对最后一列算完注意力并出草稿。rope_positions 取末列要按列主序搬。
 void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                                     const Tensor* input_embeddings, const Tensor& positions,
                                     const Tensor& rope_positions,
@@ -561,6 +600,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
     }
 }
 
+// 有 proposal_head_ 时是"稀疏草稿头"：只在词表子集（proposal_head_n_ 行）上 argmax，再用
+// proposal_head_ids_ 映射回真实 token id；没有时退回 MTP 自己的 output_head（logits 只写前 T 列）。
 void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens) {
     auto proposal_scope = work_.scope();
     const int T         = hidden.ne[1];
@@ -590,6 +631,8 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
     }
 }
 
+// 名字叫 batch，但 T 只是一段**连续列**（上限 prefill_chunk_）。RoPE 位置不能直接拿 positions：
+// 多模态下它与 KV 位置差一个视觉占位偏移（io_.rope_delta），explicit_rope_positions 为空时必须现加。
 void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
                                     const Tensor& positions,
                                     ops::CausalAttentionExecutionEnvelope envelope,
@@ -639,6 +682,8 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
     }
 }
 
+// 用刚生成的草稿 token 当作真实 token 再跑一遍 MTP（宽度 1），把草稿链从"一次一截"接到"逐个续"。
+// previous_hidden 由调用方每步回写（prefill_impl 用的是 io_.mtp->ar_hidden）；RoPE 位置要加 io_.rope_delta。
 void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                                       const Tensor& position,
                                       ops::CausalAttentionExecutionEnvelope envelope,
@@ -662,6 +707,10 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
     proposal_argmax(mtp_hidden, logits, draft_token);
 }
 
+// 共同模式：校验 → work_.reset() → Scoped* 装 active_* → run_layers → 写输出 → 卸绑定 → 再 reset()。
+
+// 非投机 decode，宽度恒为 1。传 Phase::Verify 不是笔误：Phase 决定"走哪种层拓扑"（按列推进），
+// 宽度 1 的 decode 与宽度 K+1 的验证共用同一套。hidden / logits 只是**特征**，不在这里采样。
 void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                         const Tensor& rope_positions, const Tensor& kv_table_rows,
                                         const Tensor& linear_state_source_slots,
@@ -709,6 +758,9 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
     work_.reset();
 }
 
+// 宽度 = 草稿数 + 1，加的那个 1 是"本轮的确定 token"，草稿排在它后面；valid_columns 是每行真正有效的列数。
+// 只传 source slots 没有 destination：状态由 ReplaySSM 事后回放重建，调用方必须先用
+// set_gdn_state_action(RecordForReplay, ...)。target_tokens 只是"按贪心每列会选什么"，**不是**最终决策。
 template <class Tap>
 void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
                                            const Tensor& rope_positions,
@@ -795,6 +847,8 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                              sink);
 }
 
+// 宽度上限是 kMaximumMtpDraftTokens + 1，比 target 验证那边的 kDFlashDecodeMaximumWidth 更紧。
+// 注意装的是 active_backend_kv_table_rows_ 而不是文本塔的 active_kv_table_rows_（MTP 走另一份表）。
 void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                            const Tensor& cache_positions,
                                            const Tensor& rope_positions,
@@ -837,6 +891,10 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
+// run_layers 按 config_.layer_types 选 attn_mix / gdn_mix；两者的位置 / KV / 包络都从 active_* 读。
+
+// GQA 全注意力块。fidx 是**紧凑层号**（不是层序）——GDN 层不占 KV cache，索引 KV 层视图时要跳掉。
+// 输出投影用 linear_add **直接加到 x 上**；ph 在这里没被用到，全注意力两相共用一条路径。
 void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph) {
     const auto& p  = std::get<AttentionParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
@@ -925,6 +983,13 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                     p.output.policy, work_, s);
 }
 
+// GDN（线性注意力）块。gidx 同样是紧凑层号，索引 state_ 里的卷积状态 / 循环状态。全函数切成两段
+// （投影 + 卷积、循环 delta rule），每段都有 Verify/Record 两个分支：
+//   Verify + RecordForReplay → gdn_projection_record / gated_delta_net_replay_record（只记录）
+//   Verify + UpdateInPlace   → gdn_projection_snapshot / gated_delta_net_batch_update
+//   Prefill                  → gdn_projection + causal_conv1d_silu_split / gated_delta_net（单序列）
+// 两条兜底约束：Verify 相必须显式给批大小和源槽位；UpdateInPlace 在 Verify 相下宽度必须是 1——
+// 就地更新表达不了"只接受前 j 列"，宽了会写进不该写的状态。见 docs/maintainer/replayssm-gdn.md。
 void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
     const auto& p  = std::get<GdnParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
@@ -966,6 +1031,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         Tensor gate_output =
             z.view({dimension(config_.gdn->value_width()), width, active_sequence_batch_});
         Tensor conv_states = state_.layer_view(static_cast<std::uint32_t>(gidx)).conv;
+        // valid 为空表示"整块都有效"；非空时填充列会被卷积跳过，免得卷进状态里。
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
             if (replay_records_ == nullptr) {
@@ -1060,6 +1126,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                     p.output.policy, work_, s);
 }
 
+// 提示来自**参数**（layers[next].projection_prefetch），是加载时算好的静态信息，不是"预测下一层选谁"。
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
     const auto next = static_cast<std::size_t>(layer) + 1;
     return next < parameters_.text.layers.size() ? parameters_.text.layers[next].projection_prefetch
@@ -1073,6 +1140,9 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
     ffn(h, weights.ffn, x, hints, work_, ctx_.stream);
 }
 
+// 每层：mixer（attn_mix 或 gdn_mix）→ mlp_tail → 可选的 tap 捕获。层类型是**逐层查表**的，这是个混合
+// 架构，不是每隔一层那种固定模式。每个 mixer / post-mixer 段各自在 work_.scope() 里——同一层的两段
+// 用的**不是**同一块 workspace 区域，容量按"单段峰值"规划。异常包上下文（层号 + 相位 + 列数）再抛。
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
@@ -1120,6 +1190,9 @@ void TextContext::run_layers(Tensor& x, Phase ph) {
     run_layers(x, ph, tap);
 }
 
+// 四个 prefill_chunk 重载的共同实现。分块长度先被分界点夹一次，多模态下还要问视觉侧（prepare_chunk
+// 会把它改到下一个视觉块边界——**len 可能在这里变小**）。三个"位置"别混：positions 写 KV 的**绝对**位置，
+// rope_positions 多模态下来自视觉侧（视觉后接纯文本时要加 rope_delta_），prompt_t0 是本块起点在完整提示里的下标。
 template <class Tap>
 PrefillChunkResult
 TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
@@ -1165,6 +1238,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     }
     const int base_i = static_cast<int>(base);
 
+    // 换算成相对本块起点的 split_rel：只有落在 (base, base+T] 才算数，正好等于起点也算不分界。
     const std::int64_t base64    = static_cast<std::int64_t>(base);
     const std::int64_t split_abs = prefill_split_frontier_;
     const bool has_split = split_abs > base64 && split_abs <= base64 + static_cast<std::int64_t>(T);
@@ -1211,6 +1285,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 }
             }
 
+            // 多模态 → 3 轴（视觉侧的 [3,T]）；视觉在前 → 1 轴（positions 加 rope_delta_）；否则复用 positions。
             const std::int32_t rope_axes = multimodal != nullptr ? 3 : (rope_delta_ != 0 ? 1 : 0);
             const auto roots             = workspace::text_prefill_roots(
                 work_, config_, len, rope_axes,
@@ -1238,6 +1313,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 rope_positions = roots.rope_positions;
                 ops::offset_i32_positions(positions, io_.rope_delta, rope_positions, s);
             }
+            // 包络：prefill 时每列都看得到到本块结束的**全部** KV，故上下界相等（base + t0 + len）；decode 是区间。
             ScopedPositions scoped_cache(active_cache_positions_, positions);
             ScopedPositions scoped_rope(active_rope_positions_, rope_positions);
             const auto visible = static_cast<std::uint32_t>(base_i + t0 + len);
@@ -1283,6 +1359,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 }
             }
 
+            // 输入要比主塔 **shift 一位**：MTP 第 i 列预测 token[i+1]，所以 embedding 取 token[i+1]、hidden 取第 i 列
+            // （刚算出的 xf）；本块吃完整个 prompt 时最后一列改用 bonus token，视觉 embedding 也要按同样偏移散射一份。
             if (prepare_mtp_prompt) {
                 const std::uint32_t alignment_tokens =
                     multimodal != nullptr ? static_cast<std::uint32_t>(multimodal->token_ids.size())
@@ -1375,6 +1453,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             }
         }
 
+        // 先 reset workspace 腾地方（回调里可能要分配）；第二个参数表示本块正好停在分界点上。
         if constexpr (requires { tap.consume_prefill_chunk(len, false); }) {
             work_.reset();
             tap.consume_prefill_chunk(len, split_rel > 0 && t0 + len == split_rel);
@@ -1384,8 +1463,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         break;
     }
 
+    // 分界点是单次性的：不管这次有没有真的停在它上面，用完都清掉。
     prefill_split_frontier_ = -1;
 
+    // prefill 路径没有 graph 封装，必须显式同步：processed_tokens 只有在设备真正跑完这块之后才有意义。
     timing.begin_wait();
     ctx_.synchronize();
     timing.end_wait();
@@ -1394,6 +1475,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                               .finalized        = finalize_at_end && t0 == T,
                               .timing           = timing.finish()};
 }
+
+// 四个重载 = 纯文本 / 多模态 × 是否带 DFlash sink。委托时传的是 subspan(begin, nominal_length)
+// （这一段），完整序列另经结构体里的 token_ids 传递：ids 是"要算什么"，token_ids 是"它在整体里的位置"。
 
 PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
                                               std::uint32_t nominal_length, bool finalize_at_end) {
@@ -1418,6 +1502,9 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
     return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, sink,
                         finalize_at_end);
 }
+
+// 含媒体版本：位置不是"从 base 数下来"这么简单（视觉 token 有自己的三轴位置），所以整份
+// PreparedPromptData 连同 vision 会话一起交给 prefill_impl，由它每块开头问视觉侧要 embedding 与散射表。
 
 PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData& input,
                                               std::uint32_t begin, std::uint32_t nominal_length,

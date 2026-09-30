@@ -5,6 +5,16 @@
 #include <cstdint>
 #include <optional>
 
+// ============================================================================
+// runtime/contract/timing.h —— 一次 Program 执行的耗时分解
+// ============================================================================
+//
+// 三段互斥分解：submit_host_ns / device_wait_ns / post_host_ns（主机侧提交、等设备、主机侧
+// 后处理）。主机侧的时间可以被并发掩盖，设备等待不行，混进一个总时长就再也拆不开了。
+//
+// 这些值由执行层实测上报，**不能**用"请求总时长"反推（总时长里还混着排队）；紧凑批处理下
+// 它们适合解释单个请求的延迟构成，但**不能跨并发请求相加**。
+
 namespace ninfer::runtime {
 
 // One Program execution may alternate between Host submission, a blocking Device completion
@@ -22,11 +32,14 @@ struct ExecutionTiming {
         return *this;
     }
 
+    // **刻意不含 device_wait_ns**：等设备的时候主机是空闲的，算进"主机活跃"会严重高估主机负载。
     [[nodiscard]] std::uint64_t host_ns() const noexcept { return submit_host_ns + post_host_ns; }
 
+    // 执行真正占用的时间（主机活跃 + 设备等待），仍不等于请求延迟——排队不算在内。
     [[nodiscard]] std::uint64_t elapsed_ns() const noexcept { return host_ns() + device_wait_ns; }
 };
 
+// Paused 是"不属于任何一段"的空档（交还调度器、被同批其它请求阻塞），Paused 下不开 NVTX range。
 enum class ExecutionTimingPhase : std::uint8_t {
     Submit,
     Wait,
@@ -37,6 +50,8 @@ enum class ExecutionTimingPhase : std::uint8_t {
 // Fixed-cost coarse recorder used only at Program phase boundaries, never in token/page/layer
 // loops. It starts in Submit, permits explicit Submit -> Wait -> Post transitions, and can resume
 // Submit for a later segment in the same execution unit.
+// 记账方式是**区间累加**而不是"起止相减"：每次切换结算上一段再重新计时，所以同一个记录器
+// 天然支持一次执行里的多段往返。
 class ExecutionTimingRecorder {
 public:
     using Clock = std::chrono::steady_clock;
@@ -48,6 +63,8 @@ public:
         open_range();
     }
 
+    // 没有显式 finish() 就析构（典型是异常展开）时，已累计的时间仍会并进构造时传入的汇入口：
+    // 失败路径的耗时同样有价值，tests/test_host_timing.cpp 专门钉住了这个行为。
     ~ExecutionTimingRecorder() noexcept {
         if (finished_) { return; }
         const ExecutionTiming timing = finish();
@@ -59,6 +76,7 @@ public:
 
     void begin_wait() noexcept { transition(ExecutionTimingPhase::Wait); }
 
+    // 目标是 Post 而不是 Submit：拿结果之后的整理算后处理，重新下发才叫提交。
     void end_wait() noexcept { transition(ExecutionTimingPhase::Post); }
 
     void resume_submit() noexcept { transition(ExecutionTimingPhase::Submit); }
@@ -69,6 +87,7 @@ public:
 
     void include(ExecutionTiming timing) noexcept { timing_ += timing; }
 
+    // 幂等；收尾后相位固定为 Paused、finished_ 置位，析构不再做事。
     [[nodiscard]] ExecutionTiming finish() noexcept {
         if (finished_) { return timing_; }
         accumulate(Clock::now());
@@ -99,6 +118,7 @@ private:
         }
     }
 
+    // 已 finish、或切到当前相位，都是静默空操作；**必须先 accumulate 再重置 started_**，否则这一段就丢。
     void transition(ExecutionTimingPhase next) noexcept {
         if (finished_ || next == phase_) { return; }
         const Clock::time_point now = Clock::now();

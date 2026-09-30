@@ -23,10 +23,52 @@
 #include <variant>
 #include <vector>
 
+// ============================================================================
+// context_cache/resource_manager.h —— 上下文缓存的**逻辑账本与策略层**
+// ============================================================================
+//
+// 分工（与 Program 的边界）：
+//   * Program 是物理权威，只回答"这么做在设备上成立吗"；
+//   * ResourceManager 是逻辑权威，回答"值不值得做、该用谁换谁、做完之后账怎么记"。
+// 它从不自己判断可行性，也从不自己碰设备：每一个物理决定都被包成一个对 Program 不透明的资源方案
+// （ResourcePlan，封印在某个 resource_revision 上），由 Program 去落地。
+//
+// 它维护五份账：
+//   * lanes_           逻辑 lane 状态机（Free / Materializing / Active / TerminalPending）
+//   * catalog_         私有续跑点的目录（谁、什么版本、有哪些 checkpoint、保留策略）
+//   * shared_catalog_  共享前缀的目录（同样带版本与迁移中的 pin）
+//   * session_index_   会话键 → 续跑点的开放寻址索引（缓存复用的入口）
+//   * prefix_index_    前缀摘要 → 可用来源的**短名单**（每次 inspect 前重建，见"排序提示不是证明"）
+// 外加 transaction_：当前未完成的那个资源事务（物化或活动捕获），至多一个。
+//
+// 一次请求的完整走向（四个阶段，缺一不可）：
+//   inspect   → 前置检查、重建索引、枚举所有可用来源与候选，交给 planner 挑出一个 Choice
+//   reserve   → **先冻结逻辑账本**（来源/牺牲者改 Claimed、发布格改 Reserved*），再让 Program 动手；
+//               被拒就把账本回滚回去
+//   progress  → 分步推进（可能跨多轮、可被取消），Program 每次回报一个形态
+//   adopt     → 拿 Program 的**绝对最终状态**逐条与自己的预登记对齐，一致才落地成新的账
+//
+// 三条贯穿全文件的纪律：
+//   1. **逻辑先冻结，物理后才动**，且冻结必须可逆（rollback_*）；两边的账不会出现"物理已变、逻辑没记"。
+//   2. **每个目录项都带 generation（revision）**：跨越规划期的动作要重新比对身份，对不上就是 Stale /
+//      nullopt，绝不"尽力而为"地继续。规划期算出的东西（Choice）也只是**意图**，动手前必须再验一次。
+//   3. **牺牲清单（OwnerClaim）必须逐条对账**：Program 回报的受害者数量、id 唯一性、disposition 都要
+//      与预登记严格对应；对不上是两边账本跑偏，直接抛异常而不是猜测。
+//
+// 并发：只由单个 worker 线程调用，因此全类无锁；容量在构造时预留（观测、需求窗口等），运行期不再增长。
+//
+// 模板参数 ModelContract 是刻意的模型无关做法：本层只通过它取到模型侧的类型别名（Program、各类句柄、
+// 计划与结果类型），因此它不认识 Qwen3.5 的任何具体类型，也不依赖具体模型。
+
 namespace ninfer::runtime {
 
 inline constexpr std::uint32_t kInvalidCatalogSlot = std::numeric_limits<std::uint32_t>::max();
 
+// 逻辑 lane 的四态。注意它们描述的是**逻辑归属**，不是设备上的忙碌程度：
+//   Free            无主，可以作为新请求的目的地
+//   Materializing   已被一次进行中的物化占用（物理还没就绪）
+//   Active          有活跃请求
+//   TerminalPending 该请求已经结束但还没收尾（finish / abort 之前的中转态）
 enum class LogicalLaneState : std::uint8_t {
     Free,
     Materializing,
@@ -34,12 +76,16 @@ enum class LogicalLaneState : std::uint8_t {
     TerminalPending,
 };
 
+// 保留策略的观测值：这个条目被"打中"过多少次、最近一次是什么时候（epoch 单调递增）。
+// 策略据此决定淘汰顺序——被反复命中的东西更该留下。
 struct RetentionObservation {
     RetentionClass retention_class   = RetentionClass::RecentPrivate;
     std::uint64_t selected_hit_count = 0;
     std::uint64_t last_hit_epoch     = 0;
 };
 
+// 指向"某份观测"的键。它必须带 revision：观测是绑定到某个具体版本的条目的，条目被释放又重建之后，
+// 旧键不能再命中新条目的观测（否则命中统计就会跨身份累积）。
 struct PolicyObservationKey {
     bool shared            = false;
     std::uint32_t slot     = kInvalidCatalogSlot;
@@ -56,8 +102,8 @@ struct CheckpointObservation {
     RetentionObservation observation;
 };
 
-// ResourceManager owns logical policy only.  Every physical feasibility decision and mutation is
-// represented by an opaque ModelContract::ResourcePlan sealed against Program::resource_revision().
+// ResourceManager 只拥有逻辑策略。每一个物理可行性判断与物理变更，都被表示为一个对模型不透明的
+// ModelContract::ResourcePlan——它封印在某个 Program::resource_revision() 上，动手前必须重新校验。
 template <class ModelContract>
 class ResourceManager {
 public:
@@ -87,9 +133,9 @@ public:
     using CapturePlanner                    = SharedCapturePlanner<ModelContract>;
 
 private:
-    // A transaction capability is a point-in-time structural snapshot. An active edge is a
-    // durable logical lease on the owner and deliberately does not freeze that snapshot's
-    // generation: another reader may change replica residency while the same owner remains live.
+    // 事务能力（capability）是某一时刻的结构快照；而活跃引用（active edge）是对 owner 的**持久逻辑
+    // 租约**，它刻意不冻结那份快照的 generation：同一个 owner 还活着的时候，另一个读者完全可以改变
+    // 它的副本驻留状态。也就是说——租约绑的是"这个 owner 还在"，不是"它的第几版还在"。
     struct ActiveOwnerEdge {
         LogicalOwnerKey owner;
         std::uint32_t slot = kInvalidCatalogSlot;
@@ -111,6 +157,8 @@ private:
     };
 
 public:
+    // 复用域：把"这次需求来自哪个复用时域"折叠成一对整数。同一会话（或同一发布批次，在没有会话键时）
+    // 属于同一域。用途是给共享前缀加权——**多个互不相干的域都要同一段前缀**，才说明它值得长期留下。
     struct ReuseDomainId {
         std::uint64_t low  = 0;
         std::uint64_t high = 0;
@@ -119,6 +167,8 @@ public:
                                                        ReuseDomainId) noexcept = default;
     };
 
+    // 需求窗口里的一条记录：某次请求想要哪些前缀、哪些其实已经在缓存里、最后用了哪一个。
+    // "想要"与"已有"分开记，是因为两者对保留策略的意义不同（前者是未来价值，后者是已兑现的价值）。
     struct PrefixDemandRecord {
         ReuseDomainId domain;
         std::vector<PrefixShortlistKey> candidate_keys;
@@ -126,6 +176,12 @@ public:
         std::optional<PrefixShortlistKey> selected_source_key;
     };
 
+    // 私有目录项的状态机。Claimed / ReservedForActive 都是**事务期**的临时状态：
+    //   Vacant             空位
+    //   Catalogued         正常可用
+    //   Claimed            已被某个进行中的事务预定（可能被牺牲，也可能只是来源）
+    //   ReservedForActive  已被预定为"物化完成后给它腾出的发布格"
+    // 事务中止时这些临时状态必须被还原——rollback/restore 一条都不能漏。
     enum class CatalogState : std::uint8_t {
         Vacant,
         Catalogued,
@@ -133,6 +189,7 @@ public:
         ReservedForActive,
     };
 
+    // 共享目录的同款状态机，最后一项换成 ReservedCapture：共享前缀只有捕获会写到这一格。
     enum class SharedCatalogState : std::uint8_t {
         Vacant,
         Catalogued,
@@ -140,6 +197,9 @@ public:
         ReservedCapture,
     };
 
+    // 一次规划的结果：去哪个 lane、用哪个方案、用谁当来源、打算牺牲谁、发布到哪一格。
+    // 它是一张**意图清单**，不是承诺：只有 ResourceManager 能造出来（构造私有），只能被移动、只能被
+    // reserve_materialization 消费一次；而消费前还会再验一遍世界是否还和规划时一致。
     class Choice {
     public:
         Choice(Choice&&) noexcept        = default;
@@ -189,6 +249,10 @@ public:
         friend class ResourceManager;
     };
 
+    // "物理已就绪、逻辑尚未确认"那一步的凭据。物化成功之后 lane 停在 Materializing，必须由 adopt() 把它
+    // 转为 Active 才算真正生效。之所以不让 Program 的成功直接改逻辑状态，是因为调用方（EngineCore）需要
+    // 一个明确的采纳点来决定请求何时算"已在跑"。
+    // 它持有 ResourceManager 的反向指针，因此不能跨管理器使用；状态不对时 adopt 直接 terminate。
     class PublishedActivation {
     public:
         PublishedActivation(PublishedActivation&& other) noexcept
@@ -221,12 +285,18 @@ public:
         MaterializationDiagnostics diagnostics;
     };
 
+    // 预约物化的三种结局，语义必须分清：
+    //   Reserved  逻辑账已冻结、Program 已开始动手
+    //   Stale     **方案过期**（revision 对不上，或 Program 侧物理状态已变）——该重新规划
+    //   Aborted   被取消（调用方要求停机/取消），与 Stale 的区别在于是"外部要求"而非"世界变了"
     enum class MaterializationReserveResult : std::uint8_t {
         Reserved,
         Stale,
         Aborted,
     };
 
+    // 捕获只有两种结局：启动成功，或**放弃**（Skipped）。捕获是可选的锦上添花，放弃永远合法，
+    // 因此这里没有"失败"这一档。
     enum class ActiveCaptureReserveResult : std::uint8_t {
         Reserved,
         Skipped,
@@ -236,14 +306,19 @@ public:
         ContextTransactionStatus status = ContextTransactionStatus::Aborted;
     };
 
+    // 事务推进的三种形态，与 Program 侧同名类型一一对应：还在进行中 / 收尾为一次物化 / 收尾为一次捕获。
     using ContextTransactionOutcome =
         std::variant<ContextTransactionInProgress, MaterializationOutcome, ActiveCaptureOutcome>;
 
+    // inspect 的答案：只有 Ready 才带 Choice。其余三档都是"现在不能做"，但**原因不同**——
+    // 永久不可行要上报给调度去终止，暂时受阻只是等下一轮。
     struct Inspection {
         Readiness readiness = Readiness::TemporarilyBlocked;
         std::optional<Choice> choice;
     };
 
+    // 构造即定型：lane 数与两个目录容量决定了这层能记多少账。约束（lane 数不超过启动并发、私有目录
+    // 不小于 lane 数）在构造时校验；观测与需求窗口的容量也在这里一次性预留，运行期不再分配。
     ResourceManager(std::uint32_t lane_count, std::uint32_t private_catalog_capacity,
                     std::uint32_t shared_catalog_capacity, bool cache_enabled,
                     std::uint32_t max_long_anchors, ContextMachineCostModel cost_model)
@@ -270,6 +345,15 @@ public:
         }
     }
 
+    // 准入探查：给定一条请求，回答"现在能不能进来、进来的话怎么进"。
+    //
+    // 顺序上有三层判断，先便宜后昂贵：
+    //   1. 事务冲突 → TemporarilyBlocked（本层或 Program 已有未完成事务，谁都别想插队）；
+    //   2. **孤立可行性** → PermanentlyInfeasible（不借助任何复用都放不下，那再怎么等也不会变可行，
+    //      由 ResourceManager 上报给调度去终止这条请求，而不是反复重试）；
+    //   3. 有没有空闲 lane → 没有就 TemporarilyBlocked。
+    // 通过之后才重建前缀索引、逐一枚举可用来源（各自成为一个候选），连同"孤立根候选"一起交给 planner，
+    // 由后者挑出一个 Choice。方向：这里只负责**枚举**，不负责排序与取舍——取舍在 planner 里。
     [[nodiscard]] Inspection inspect(Program& program, const PreparedPrompt& prompt,
                                      const RequestBasePlan& base, std::uint64_t publication_order,
                                      PlanningAllowance allowance = {}) {
@@ -404,6 +488,7 @@ public:
         };
     }
 
+    // 为持续回填取证：先确认这份方案还没过期（否则证明没有意义），再把举证责任交给 Program。
     [[nodiscard]] std::optional<PersistentBackfillProof>
     prove_persistent_backfill(Program& program, const RequestBasePlan& blocked_head,
                               const Choice& candidate,
@@ -415,6 +500,13 @@ public:
                                                  persistent_borrowers);
     }
 
+    // 预约并启动一次物化。这里是"逻辑先行"最集中的地方，顺序不能颠倒：
+    //   1. 校验（当前不能有事务 / 方案没坏 / **revision 仍相等** / Choice 内部自洽）——
+    //      revision 不等直接返回 Stale，一个字节都没动；
+    //   2. 把 Choice 变成 MaterializationRecord 存进 transaction_，并**先冻结逻辑账本**
+    //      （来源与牺牲者转 Claimed、发布格转 Reserved*）；
+    //   3. 才把方案交给 Program 动手；
+    //   4. Program 拒绝（Aborted）就把第 2 步的账本回滚，事务清空——所以外部看到的要么全无、要么全有。
     [[nodiscard]] MaterializationReserveResult
     reserve_materialization(Program& program, Choice&& choice, PreparedPrompt&& prompt,
                             CancellationFlagView cancellation) {
@@ -448,6 +540,7 @@ public:
         return MaterializationReserveResult::Reserved;
     }
 
+    // 当前开着的事务属于哪一类（没有则为 nullopt）。调用方据此决定推进时该走哪条分支。
     [[nodiscard]] std::optional<ContextTransactionKind> context_transaction_kind() const noexcept {
         if (std::holds_alternative<MaterializationRecord>(transaction_)) {
             return ContextTransactionKind::Materialization;
@@ -458,6 +551,9 @@ public:
         return std::nullopt;
     }
 
+    // 推进事务：让 Program 往前走一步，然后把它的**终态**吸收进自己的账（adopt_*_progress）。
+    // 还在进行中时原样返回，调用方下一轮再来。注意吸收失败即抛异常——那意味着两边的账已经不一致，
+    // 继续跑只会错得更远。
     [[nodiscard]] ContextTransactionOutcome
     progress_context_transaction(Program& program, CancellationFlagView cancellation) {
         if (std::holds_alternative<std::monostate>(transaction_) ||
@@ -482,6 +578,9 @@ public:
             std::move(progress));
     }
 
+    // 采纳：把 lane 从 Materializing 正式转为 Active，并关掉 Program 侧的事务。
+    // 前置条件全部不满足时直接 terminate —— 注意这里**不是抛异常**：走到这一步说明物理资源已经就绪，
+    // 逻辑却对不上，属于不可恢复的不变量破裂，任何"优雅处理"都只会掩盖资源泄漏。
     void adopt(Program& program, PublishedActivation&& activation) noexcept {
         if (activation.owner_ != this || !activation.result_ ||
             activation.destination_.value >= lane_count_ ||
@@ -498,6 +597,14 @@ public:
         program.finalize_context_transaction();
     }
 
+    // 处理一次捕获机会（offer 从待提交批次里带出来，只有当本轮真的生成了 Begin 令牌时才存在）。
+    //
+    // 三条走向，按"便宜且确定"到"昂贵且需要搜索"排列：
+    //   1. 已被占用（本层或 Program 有事务）→ skip_capture，明确放弃，不留悬念；
+    //   2. 恰好命中一个**已在册的完全相同的共享前缀** → 直接发布私有部分，不必搜索；
+    //   3. 否则才进入 scenario 搜索：为一个空槽位、或为若干可被替换的共享条目，逐个评估"值不值得"，
+    //      选中者可能还附带一个压力方案（牺牲谁），由 Program 落地。
+    // 方向：捕获是**可选收益**，所以任何一步不确定都退化成 Skipped——绝不能因为捕获而威胁到已承诺的请求。
     [[nodiscard]] ActiveCaptureReserveResult
     reserve_active_capture(Program& program, LaneId lane, CaptureOffer&& offer,
                            std::uint32_t blocked_runnable_requests,
@@ -920,11 +1027,18 @@ public:
         return ActiveCaptureReserveResult::Reserved;
     }
 
+    // 把 lane 标记为"待收尾"：请求已经结束，但资源还没交还。finish / abort 是唯一的出口。
     void mark_terminal_pending(LaneId lane) {
         require_lane(lane, LogicalLaneState::Active);
         lanes_[lane.value] = LogicalLaneState::TerminalPending;
     }
 
+    // 正常结束一条序列，并决定它的续跑点**是否值得留在缓存里**（这是本层而非 Program 的决定）：
+    //   * 缓存关闭，或 Program 判定为 Released → 清格、释放引用、lane 回 Free；
+    //   * 值得保留 → 把发布格从 ReservedForActive 转成 Catalogued，接管续跑点句柄、摘要、会话与保留策略，
+    //     推进 revision，并（按需）更新会话索引。
+    // 有一条降级路径值得注意：Program 若报出"无法保留"（返回非 Consumed），本层会退回 abort 语义——
+    // 宁可当作异常结束，也不留下一个既没保留又没释放的悬空条目。
     [[nodiscard]] FinishResult finish(Program& program, LaneId lane, SequenceHandle sequence) {
         require_lane(lane, LogicalLaneState::TerminalPending);
         if (!std::holds_alternative<std::monostate>(transaction_) ||
@@ -994,6 +1108,7 @@ public:
         return result;
     }
 
+    // 异常结束：不保留任何东西，一律清格 + 释放引用 + lane 回 Free。Program 若没消费掉序列即抛错。
     [[nodiscard]] AbortResult abort(Program& program, LaneId lane, SequenceHandle sequence) {
         if (!std::holds_alternative<std::monostate>(transaction_) ||
             program.has_context_transaction()) {
@@ -1014,6 +1129,8 @@ public:
         return result;
     }
 
+    // 按提交结果推进逻辑 lane：仍是 Active 的什么都不做，被标记 Finishable 的转 TerminalPending，
+    // 被取消的立刻释放。行与 lane 必须严格对齐——对不上就是调用方传错了成员表。
     void apply_commit(std::span<const LaneId> lanes,
                       const typename ModelContract::CommitResult& result) {
         if (lanes.size() != result.row_count) {
@@ -1035,6 +1152,8 @@ public:
         }
     }
 
+    // 丢弃待处理事务时，这**整批** lane 都按取消处理（不像 commit 那样逐行区分）。
+    // 前提是 Program 确实消费掉了那批成员，否则抛错——丢弃必须是真的丢弃。
     void apply_discard(std::span<const LaneId> lanes,
                        const typename ModelContract::DiscardResult& result) {
         if (lanes.size() != result.row_count || result.status != ConsumeStatus::Consumed) {
@@ -1043,6 +1162,8 @@ public:
         for (const LaneId lane : lanes) { release_cancelled_lane(lane); }
     }
 
+    // 提交失败后的兜底释放：尽力把每个仍被占据的 lane 收回，回收过程中的任何异常都被吞掉——
+    // 这条路径本身已经处在错误处理里，它唯一的目标是别把资源漏掉，不是报告问题。
     void release_failed_commit(std::span<const LaneId> lanes) noexcept {
         for (const LaneId lane : lanes) {
             if (lane.value < lane_count_ && active_[lane.value].occupied) {
@@ -1053,6 +1174,9 @@ public:
         }
     }
 
+    // 汇总统计：本层记的逻辑账（搬运计数/字节/耗时、压力搜索的各种计数）来自自己的 context_stats_，
+    // 而"占了多少"这类物理量直接问 Program 的 physical_usage()。共享引用数在这里现算——它反映的是
+    // 当前活跃的租约数，属于逻辑事实。
     void populate_runtime_stats(Program& program, RuntimeStats& out) const noexcept {
         out.state_moves                        = context_stats_.state_moves;
         out.state_forks                        = context_stats_.state_forks;
@@ -1123,6 +1247,8 @@ public:
         return lane.value < lane_count_ ? lanes_[lane.value] : LogicalLaneState::Free;
     }
 
+    // Program 做过故障清理（fail_all_cleanup）之后，本层的全部账随之作废：句柄、目录、索引、需求窗口
+    // 一律清空，lane 全部回 Free。此后本层不再假设任何既有句柄有效——这是两边重新对齐的唯一方式。
     void clear_after_program_cleanup() noexcept {
         transaction_.template emplace<std::monostate>();
         for (CatalogEntry& entry : catalog_) {
@@ -1143,6 +1269,16 @@ public:
     }
 
 private:
+    // ---- 内部记账结构 ----
+    //
+    // 分两类，职责不要混淆：
+    //   * 目录（CatalogEntry / SharedCatalogEntry）是**长期**账，代表真实持有的东西；
+    //   * 记录（MaterializationRecord / ActiveCaptureRecord）是**事务期**账，只活在一次事务里，
+    //     用来在动手前冻结意图、在结束时逐条对账。
+    // 索引（SessionIndexEntry / PrefixIndexEntry）都是可重建的派生视图，不是事实来源。
+
+    // 一个待评估的准入候选：一条附加了"用哪个来源、用哪个 checkpoint"的具体方案。
+    // selected_observation 记录"如果选了它，该给谁记一次命中"，因此它也是策略观测的埋点。
     struct Candidate {
         std::optional<AdmissionCandidate> plan;
         bool current_session_binding = false;
@@ -1152,6 +1288,9 @@ private:
         std::optional<PrefixShortlistKey> source_key;
     };
 
+    // 私有续跑点的目录项。revision 是它的**身份代次**：每次内容变化就前进一格，于是任何跨越规划期的
+    // 引用（CatalogCapability.generation）都能被判定是否过期。summary 是本层对物理状态的逻辑摘要副本，
+    // handle 才是那份物理能力的真正句柄。
     struct CatalogEntry {
         CatalogState state     = CatalogState::Vacant;
         std::uint64_t id       = 0;
@@ -1163,6 +1302,9 @@ private:
         RetentionClass retention = RetentionClass::RecentPrivate;
     };
 
+    // 共享前缀条目。与私有条目的差别有三处：只有一个 checkpoint（共享前缀就是一段固定前缀）、
+    // 用一份 observation 而不是每个 checkpoint 一份、以及多了 transaction_pins——正在被事务引用的
+    // 共享条目不能被当作牺牲者（迁移中的东西不能动）。
     struct SharedCatalogEntry {
         SharedCatalogState state = SharedCatalogState::Vacant;
         std::uint64_t id         = 0;
@@ -1181,6 +1323,8 @@ private:
         Deleted,
     };
 
+    // 会话索引单元：会话键 → 当前代表它的那个续跑点。Deleted 是开放寻址的墓碑（删除后不能直接置空，
+    // 否则会截断探测链），因此查找要在 Empty 处停、在 Deleted 处继续。
     struct SessionIndexEntry {
         SessionIndexState state = SessionIndexState::Empty;
         CacheSessionKey key;
@@ -1190,6 +1334,9 @@ private:
         std::uint64_t publication_order = 0;
     };
 
+    // 前缀索引条目：把"前缀摘要"映射到"哪个目录项能提供它"。它是**短名单**，只用来把探查范围缩小到
+    // 可能命中的那几个来源；命中与否仍由精确比对（以及 Program 的评估）决定。每次 inspect 前整体重建，
+    // 因此它永远是派生视图而非事实来源。
     struct PrefixIndexEntry {
         bool occupied = false;
         bool shared   = false;
@@ -1200,6 +1347,8 @@ private:
         CheckpointRef checkpoint;
     };
 
+    // 一个活跃 lane 的逻辑持有物。retained_private_source / shared_sources 是**租约**（ActiveOwnerEdge），
+    // 它们说明"这条活跃请求还压着谁"，从而决定那些来源当前不可被牺牲、也不可被重复选中。
     struct ActiveEntry {
         bool occupied                  = false;
         std::uint32_t publication_slot = kInvalidCatalogSlot;
@@ -1212,6 +1361,8 @@ private:
         std::vector<ActiveOwnerEdge> shared_sources;
     };
 
+    // 进行中的物化事务：Choice 的冻结副本 + 本层在动手前就改好的临时账（Claimed / Reserved）。
+    // demand 也挂在这里，等到真正发布成功才提交进需求窗口——没成功过的需求不该影响保留策略。
     struct MaterializationRecord {
         LaneId destination;
         std::optional<CatalogCapability> private_source;
@@ -1229,6 +1380,9 @@ private:
         PrefixDemandRecord demand;
     };
 
+    // 进行中的捕获事务：记录它要写进哪个共享格、是否替换掉现有条目（replacement_id）、以及它打算
+    // 牺牲的私有/共享条目清单。replacement_* 非零就意味着这一格在被替换，收尾时旧条目要么被换掉、
+    // 要么原样留下——两种结局都要能还原。
     struct ActiveCaptureRecord {
         LaneId lane;
         bool publishes_private                  = false;
@@ -1272,6 +1426,8 @@ private:
         return ActiveOwnerEdge{.owner = capability.owner, .slot = capability.slot};
     }
 
+    // 有活跃租约的目录项不能被动：既不能当牺牲者，也不能被重复选为来源。下面两个查询是这条规则的
+    // 唯一实施点——私有侧最多一条租约所以只问"有没有"，共享侧可能被多条活跃请求同时压着所以数个数。
     [[nodiscard]] bool private_has_active_edge(std::uint32_t slot) const noexcept {
         return std::any_of(active_.begin(), active_.begin() + lane_count_,
                            [&](const ActiveEntry& active) {
@@ -1316,6 +1472,7 @@ private:
         return static_cast<std::size_t>(private_capacity) * width + shared_capacity;
     }
 
+    // 身份代次只能前进，且**跳过 0**：0 在整套契约里表示"无效/空"，任何有效条目都不该拿到它。
     static void advance_revision(std::uint64_t& revision) noexcept {
         if (++revision == 0) { ++revision; }
     }
@@ -1419,6 +1576,8 @@ private:
         return count;
     }
 
+    // 保留权重：越"贵"的类别越不该被牺牲（LiveSession 最贵、SharedStable 在私有侧为 0 因为它本就属于共享）。
+    // 这是交给 planner 的**偏好**，不是硬约束——硬约束来自租约与 Program 的评估。
     [[nodiscard]] static std::uint32_t private_retention_weight(RetentionClass retention) noexcept {
         switch (retention) {
         case RetentionClass::Disposable:
@@ -1433,6 +1592,7 @@ private:
         return 0;
     }
 
+    // lane 状态断言：越界、状态不符，或"声称 Active/TerminalPending 但 ActiveEntry 是空的"都算违约。
     void require_lane(LaneId lane, LogicalLaneState expected) const {
         if (lane.value >= lane_count_ || lanes_[lane.value] != expected ||
             ((expected == LogicalLaneState::Active ||
@@ -1576,6 +1736,9 @@ private:
         advance_revision(entry.revision);
     }
 
+    // 重建前缀短名单。时机是每次 inspect：规划必须看到**当下**可用的来源，所以索引从不跨轮复用。
+    // 容量是构造时算好的固定值（私有条目 × (长锚点上限 + 2) + 共享条目），超了说明容量算式与目录状态
+    // 不一致，直接抛——不静默丢弃，否则会悄悄漏掉可用来源。
     void rebuild_prefix_index() {
         for (PrefixIndexEntry& entry : prefix_index_) { entry = {}; }
         std::size_t cursor = 0;
@@ -1615,6 +1778,8 @@ private:
         }
     }
 
+    // 索引项是否仍指向同一个活着的条目：id 与 revision 都要对得上。索引是快照，目录会变，
+    // 因此每次使用前都要过这一关——这正是"排序提示不是证明"在索引层的体现。
     [[nodiscard]] bool valid_prefix_index_entry(const PrefixIndexEntry& index) const noexcept {
         if (!index.occupied) { return false; }
         if (!index.shared) {
@@ -1637,6 +1802,9 @@ private:
         return epoch;
     }
 
+    // 挑选"顺带要捕获的共享前缀":一次物化本来就要算 prompt，如果其中某些前沿顺手也能发布成共享前缀,
+    // 就是白赚的复用资产。这里逐个机会判断值不值：已经常驻的跳过、本次私有来源自身覆盖的跳过，
+    // 剩下的按证据强度与成本决定，最后交给 Program 表态。返回的是前沿列表（最终调度意图）。
     template <class SplitCostFn>
     [[nodiscard]] std::vector<std::uint32_t> select_materialization_shared_captures(
         Program& program, const RequestBasePlan& base, const Candidate& selected_candidate,
@@ -1827,6 +1995,13 @@ private:
         return selected_frontiers;
     }
 
+    // 组织的规划调用：把"候选 + 所有潜在牺牲者 + 成本/收益政策 + 逻辑目标 + 最终调度意图"打包，
+    // 交给 MaterializationPlanner 选出一个方案，再把它翻译成本层的 Choice（含牺牲清单与需求记录）。
+    // 三个回调是流程的关键接口：
+    //   build_pressure_inputs 惰性构造（只有需要探索压力时才做，且只允许做一次）；
+    //   logical_goal 声明"发布格必须落在哪一类格子里"（空位或某个被驱逐者腾出的格子）；
+    //   final_schedule 在候选敲定后决定要顺带捕获哪些共享前缀。
+    // 注意这里的两次校验：挑选后的方案若与目录状态不符（期间被改动）就返回 nullopt，宁可本轮不干。
     [[nodiscard]] std::optional<Choice>
     plan_materialization(Program& program, const PreparedPrompt& prompt,
                          const RequestBasePlan& base, LaneId destination,
@@ -2156,6 +2331,9 @@ private:
         return choice;
     }
 
+    // 动手前的最后一道静态校验：规划期算出的 Choice 是可过期的意图，这里逐项确认世界仍然一致——
+    // 目标 lane 仍空闲、来源/牺牲者的 id 与 revision 未变、没有新出现的活跃租约、发布格确实可用
+    // （要么本来就是空的，要么会被来源或某个被驱逐的牺牲者腾出来）。任一不符即抛，交回上层重新规划。
     void validate_choice(const Choice& choice, ProgramResourceRevision revision) const {
         if (!choice.plan_ || choice.destination_.value >= lane_count_ ||
             lanes_[choice.destination_.value] != LogicalLaneState::Free || revision.value == 0 ||
@@ -2255,6 +2433,9 @@ private:
         };
     }
 
+    // 冻结与回滚是一对：reserve_* 把涉及到的格子标成事务期状态（别人再也不能选中它们），
+    // rollback_* 在 Program 拒绝或事务中止时把它们原样还原。两者必须严格对称，否则会出现
+    // "格子永久卡在 Claimed"这类不可见泄漏。
     void reserve_logical_materialization(const MaterializationRecord& record) noexcept {
         lanes_[record.destination.value] = LogicalLaneState::Materializing;
         if (record.private_source) {
@@ -2318,6 +2499,8 @@ private:
                                                              : SharedCatalogState::Catalogued;
     }
 
+    // 记一次"被选中"：只有**成功发布**的物化才算命中（所以这里在 published 分支才调用）。
+    // epoch 单调递增，用来给保留策略提供"最近有多常用"的时间轴。
     void observe_selected_hit(const MaterializationRecord& record) noexcept {
         if (record.selected_observation) {
             RetentionObservation* selected = resolve_observation(*record.selected_observation);
@@ -2328,6 +2511,8 @@ private:
         }
     }
 
+    // 需求窗口是一个固定长度的滑动窗（最旧的被挤掉）：它把"最近若干次请求想要什么前缀"变成可比较的
+    // 证据，用来给共享条目加权、也给 explicit_credit 设置过期。窗口容量在构造时就预留。
     void commit_demand(PrefixDemandRecord&& demand) noexcept {
         if (demand_window_.capacity() < kDemandWindowCapacity) { std::terminate(); }
         if (demand_window_.size() == kDemandWindowCapacity) {
@@ -2368,6 +2553,8 @@ private:
         }
     }
 
+    // 把观测键解析回具体的观测槽；键里的 revision 与当前条目不一致就返回 nullptr——观测记录跨代次
+    // 就没有意义了，宁可丢掉也不能记到新条目头上。
     [[nodiscard]] RetentionObservation*
     resolve_observation(const PolicyObservationKey& key) noexcept {
         if (!key.shared) {
@@ -2403,6 +2590,9 @@ private:
                    : static_cast<std::uint32_t>(count);
     }
 
+    // 把 planner 报出的"哪些 checkpoint 没保住"翻译成本层要执行的删除清单，并顺带做对账：
+    // 报出的必须属于这个 owner、不能重复、数量要与其持有的 checkpoint 总数吻合，否则抛错——
+    // 少报一个就意味着有 checkpoint 会静默泄漏。
     template <class ContainsCheckpoint>
     [[nodiscard]] static std::vector<CheckpointRef> selected_checkpoint_drops(
         PlanningOwnerId owner, VictimDisposition disposition, std::uint32_t expected_drop_count,
@@ -2491,6 +2681,9 @@ private:
         }
     }
 
+    // validate_*_action / apply_*_action 是"预登记 vs 实际结局"的对账对，四者成两对。
+    // 校验阶段回答"Program 报的 disposition 在我们冻结的意图里合法吗"，应用阶段才真正改账。
+    // 分两步是为了：先整体验完再动手，避免验到一半发现不符却已经改了前几条。
     template <class Result>
     void validate_private_action(const OwnerClaim& claim, bool target_committed,
                                  const Result& result) const {
@@ -2641,6 +2834,8 @@ private:
         entry.state = SharedCatalogState::Catalogued;
     }
 
+    // 中止时的还原：只还原那些**还停在 Claimed**的格子（说明 Program 没对它们做出任何报告），
+    // 已经落到终态的条目不动。这让"部分生效后中止"也能得到一致账本。
     void restore_unreported_materialization(const MaterializationRecord& record) noexcept {
         if (record.private_source &&
             catalog_[record.private_source->slot].state == CatalogState::Claimed) {
@@ -2667,6 +2862,15 @@ private:
         }
     }
 
+    // 吸收一次物化的终态——本文件里最重的一段，但它的骨架始终是同一句话：
+    // **"Program 报的绝对最终状态，必须与我冻结的意图逐条对得上，然后才据实改账。"**
+    // 顺序：
+    //   1. 形态校验：终态不能是 InProgress、受害者数量必须与预登记一致、每个 id 唯一；
+    //   2. 结构校验：目标 lane / 发布格 / 来源能力都还停在预期的临时状态；
+    //   3. 逐条 validate_*_action（disposition 是否合法、快照是否自洽）；
+    //   4. 逐条 apply_*_action，再处理来源（保留则更新摘要与 revision，被消费则清空）与共享来源的 pin；
+    //   5. 中止就还原并释放 lane；发布则把发布格转 ReservedForActive、建立 ActiveEntry 与租约、
+    //      提交需求记录，最后交出一张 PublishedActivation——但那还不算生效，要等 adopt()。
     [[nodiscard]] MaterializationOutcome
     adopt_materialization_progress(Program& program, ProgramMaterializationResult&& result) {
         MaterializationRecord* record = std::get_if<MaterializationRecord>(&transaction_);
@@ -2925,6 +3129,8 @@ private:
         };
     }
 
+    // 吸收一次捕获的终态：同一套对账骨架，但把"发布格"换成共享目录格，且多一种结局——被替换的那个
+    // 共享条目要么已被换掉、要么原样保留，两种都要如实反映到账上。
     [[nodiscard]] ActiveCaptureOutcome
     adopt_active_capture_progress(Program& program, ProgramActiveCaptureResult&& result) {
         ActiveCaptureRecord* record = std::get_if<ActiveCaptureRecord>(&transaction_);
@@ -3118,6 +3324,8 @@ private:
         return {.status = ContextTransactionStatus::Published};
     }
 
+    // 交还某条 lane 压着的所有租约。先逐条验它们仍然指向存活的条目（租约绑身份不绑版本，但条目必须还在），
+    // 验完再清——租约是"别人不能动这个条目"的唯一依据，静默丢掉会让活跃请求的来源被误牺牲。
     void release_active_references(LaneId lane) {
         ActiveEntry& active = active_[lane.value];
         if (active.retained_private_source) {
@@ -3150,6 +3358,7 @@ private:
         active.shared_sources.clear();
     }
 
+    // 取消一条 lane 并释放它的全部逻辑资源：租约、发布格、ActiveEntry，最后回 Free。
     void release_cancelled_lane(LaneId lane) {
         if (lane.value >= lane_count_ || !active_[lane.value].occupied ||
             (lanes_[lane.value] != LogicalLaneState::Active &&
@@ -3171,6 +3380,9 @@ private:
         return hash;
     }
 
+    // 会话索引：开放寻址的哈希表。查找在 Empty 处终止、在 Deleted 墓碑处继续探测（墓碑不能提前终结
+    // 探测链，否则会漏掉后面的同键条目）。这一族函数的职责只有一个：把"同一个会话"稳定地映射到
+    // 当前代表它的那个续跑点，从而让多轮对话能复用上一轮的状态。
     [[nodiscard]] std::optional<std::size_t>
     find_session_cell(const CacheSessionKey& key) const noexcept {
         if (session_index_.empty()) { return std::nullopt; }
@@ -3226,6 +3438,9 @@ private:
         }
     }
 
+    // 发布会话绑定。publication_order 是**新旧裁决**依据：更新的发布序可以顶掉旧的（旧的被"降级"，
+    // 见 demote_replaced_session），更旧的发布序则直接不采纳。相同发布序却指向不同续跑点属于矛盾，
+    // 抛错——那意味着同一轮里出现了两个自称最新的绑定。
     [[nodiscard]] bool publish_session(const CacheSessionKey& key, std::uint32_t slot,
                                        std::uint64_t owner_id, std::uint64_t revision,
                                        std::uint64_t publication_order) {
@@ -3257,6 +3472,8 @@ private:
         return true;
     }
 
+    // 被顶掉的旧绑定降级为普通私有续跑点：条目本身**不删除**（它仍是有效缓存），只是不再享受
+    // "会话当前代表"的身份，保留类别也退回 RecentPrivate。
     void demote_replaced_session(const SessionIndexEntry& previous, std::uint32_t replacement_slot,
                                  std::uint64_t replacement_id) noexcept {
         if (previous.slot >= catalog_count_ ||
@@ -3275,6 +3492,8 @@ private:
         }
     }
 
+    // 搬运观测：Program 只报"搬了什么、多少、多久"，分类累加属于逻辑层的活。因此分页/分字节/分方向
+    // 的统计都在这里成形，而不是让 Program 维护一堆计数器。
     void observe_transfer(const ContextTransferObservation& observation) noexcept {
         const double seconds = static_cast<double>(observation.elapsed_ns) * 1.0e-9;
         context_stats_.actual_context_transfer_seconds += seconds;
@@ -3361,6 +3580,11 @@ private:
         context_stats_.historical_fork_hits += result.operations.historical_fork_hits;
     }
 
+    // ---- 状态 ----
+    //
+    // 事实来源（前三组）：逻辑 lane、两个目录、当前事务；其余都是派生或统计。
+    // session_index_ / prefix_index_ 随时可从目录重建；observation_scratch_ / demand_window_ 是
+    // 容量固定的观测缓冲；两个 epoch 分别给保留策略与需求窗口提供单调时间轴。
     std::uint32_t lane_count_           = 0;
     std::uint32_t catalog_count_        = 0;
     std::uint32_t shared_catalog_count_ = 0;
