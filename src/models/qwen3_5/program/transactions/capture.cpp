@@ -14,8 +14,38 @@
 #include <variant>
 #include <vector>
 
+// ============================================================================
+// capture.cpp —— 捕获面：把**正在跑的**请求拍成一份可复用的缓存
+//
+// 与物化事务正好互为镜像：物化是"把一份缓存变成一条活着的请求"，捕获是"把活着的请求变成一份缓存"。
+// 两者共用同一套压力流水线（牺牲者账、搬运阶段机、终态回报），但捕获有一条自己的底线——它绝不能危及
+// 已经在跑的请求：凡是达不到前提就退化成"跳过"（skip_capture），只有**调用方违约**（票据过期、句柄
+// 失效、lane 换代、已有别的上下文事务）才抛异常。
+//
+// 一次捕获有两类产物，可以各自独立开关：
+//   · 私有产物（publish_private）：给这条序列自己留的回滚点（rewrite 检查点 / 长锚点）。它只固化**状态
+//     镜像**加一份重建配方（rebuild_work）——KV 不搬，以后靠重放重新长出来。
+//   · 共享产物（publish_shared）：把这段前缀发布成公共缓存，这是唯一会同时固化 state 与两种 KV 地址
+//     空间的路径；发布之后它们整体不可变，只有引用计数会动。
+//
+// 全文件的流水线（与 program_impl.h 第 10 段的声明一一对应，按出现顺序分成四段）：
+//   inspect（只算不动）→ reserve（认领容量与共享槽位）→ prepare → enqueue →（publish | abort）
+// reserve 之后这条路径就不能再改主意了：后面每一步都按 reserve 时钉下的那组数字复核，对不上就是内部
+// 违约。推进由一个阶段机驱动（progress_active_capture_transaction），它可以跨多次调用续跑——压力搬运
+// 要等设备事件，中途不能装作已经做完。
+// ============================================================================
 namespace ninfer::models::qwen3_5::detail {
 
+// ============================================================================
+// 评估面：只算不动
+//
+// 这一段回答三个问题：这个捕获点还成不成立、值不值得做、物理上要花多少。三个函数的共同纪律是**不碰
+// 状态**——判断出错只会让结论更保守，不会留下半成品。
+// ============================================================================
+
+// 判定"这个捕获点能否直接复用一份已经存在的共享前缀"（去重命中）。要求是**精确**相等：同一前沿、
+// 同一短名单键、且逐 token 前缀相等。这不是近似匹配的入口——判错了就等于把别人家的缓存当成自己的
+// 前缀拿走，所以宁可判不中（退回老老实实做一次捕获），也不接受"看起来一样"。
 bool ProgramImpl::shared_capture_matches(const CaptureOffer& offer,
                                          const SharedPrefixHandle& shared) const {
     if (!valid_capture_offer(offer) || !valid_shared_prefix(shared)) { return false; }
@@ -29,6 +59,28 @@ bool ProgramImpl::shared_capture_matches(const CaptureOffer& offer,
            group.identity->prefix_equals(*candidate.identity);
 }
 
+// 对一个捕获候选做完整的物理评估，结论全部放进 CaptureAssessment，本函数**不改任何状态**。
+//
+// 三个可选参数是三种"省地方"的手段，互斥关系由调用方负责，这里只做校验：
+//   exact_shared        去重命中——这份前缀已经在公共缓存里，不值得再捕获一遍；
+//   replacement         顶替某份共享前缀（认领它的槽位与容量，而不是新开一份）；
+//   private_replacement 长锚点已经占满时，指定牺牲哪一个（没满就没得选）。
+//
+// 产出的结论按"谁来读"分三组：
+//   · 给 Runtime 看的结论面：publishes_private / publishes_shared / physically_feasible（可行性的
+//     唯一权威表述）/ state_placement / 需要哪些搬运 / 私有替换候选有哪些；
+//   · 给压力搜索看的：protected_rebuild_work（压力不许破坏的重建配方，两种产物都填）与
+//     projected_recovery_work（这份检查点以后被牺牲时还剩哪些恢复路径；只有共享产物才填，因为只有
+//     共享产物会当牺牲者）；
+//   · 给事务自己用的四项物理数字：reservation_added / reservation_credit / final_removed /
+//     final_added。reserve 会把它们原样钉进事务，publish 时再逐项复核。
+//
+// 两个容易读错的地方：
+//   · KV 的整页是按引用共享的，不复制，所以"搬"的只有非对齐的尾页那一页；由此，唯一可写的整页会把
+//     归属从活跃请求挪给检查点（active_entitlement_delta.removed），活跃请求则只为尾页付出新页
+//     （added）。
+//   · state_placement 是**物理放置选择**而不是偏好：设备侧还能再开一份镜像就用 DeviceFork，已经被
+//     活跃镜像加既有检查点占满时才退到 HostSnapshot（下面那段注释解释它怎么保住两个逻辑检查点）。
 CaptureAssessment
 ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                              const SharedPrefixHandle* replacement,
@@ -184,10 +236,9 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
         assessment.state_placement = qwen3_5::CaptureStatePlacement::DeviceFork;
         added.device.state_slots   = 1;
     } else {
-        // A capture must not require a third Device image when the active image and a retained
-        // checkpoint already occupy the C+H pool.  Snapshot the frozen logical checkpoint to
-        // Host, then transfer ownership of its unchanged Device replica to the continuing active
-        // identity.  This preserves both logical checkpoints without assigning fixed slot roles.
+        // 活跃镜像与一份既有检查点已经占满 C+H 池时，一次捕获不应该还需要第三份设备镜像。做法是把
+        // 那份冻住的逻辑检查点快照到 Host，再把它没有变过的设备副本**整体转让**给继续跑下去的活跃
+        // 身份——既保住了两个逻辑检查点，又不需要给任何槽位钉死角色。
         assessment.state_placement = qwen3_5::CaptureStatePlacement::HostSnapshot;
         added.host.state_slots     = 1;
     }
@@ -279,6 +330,12 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
     return assessment;
 }
 
+// 把一次捕获的评估结论翻译成**压力搜索的候选**：只有共享产物才需要它——私有检查点从不驱赶别人，
+// 只有"要不要额外发布一份公共前缀"才值得用牺牲者去换地方（所以不是共享发布就直接违约）。
+//
+// 候选里除数字外还带两样东西：physical_status（现在可行不可行）与 expandable（不可行时是否允许靠腾
+// 空间救回来），以及一个把 resource_revision 混进去的摘要。摘要只干一件事：让封印出去的压力方案在
+// 资源世界变了之后立刻被识别为过期（物理版本、前沿、可行性三者任一变了，方案就该作废）。
 std::unique_ptr<CapturePressureCandidateImpl>
 ProgramImpl::make_capture_physical_candidate(const CaptureAssessment& assessment) const {
     if (assessment.implementation == nullptr || !assessment.publishes_shared ||
@@ -313,6 +370,10 @@ ProgramImpl::make_capture_physical_candidate(const CaptureAssessment& assessment
     return details;
 }
 
+// 放弃一个捕获点。注意这是**终局决定**而不是延后：票据被消费掉、当前捕获点被划掉（next_capture
+// 前进），同一个点不会再被递第二次——外部若还想要，只能等下一次预填重新产生捕获点。
+// 顺带收个尾：prompt 早就处理完、请求也已经离开 Prefilling 时（前缀复用命中的那种情形），预填控制
+// 记录本身已经没有用武之地，直接丢掉。
 void ProgramImpl::skip_capture(CaptureOffer&& offer) {
     if (!valid_capture_offer(offer)) { throw std::logic_error("capture offer is not skippable"); }
     const std::uint32_t lane = ContractAccess::lane(offer).value;
@@ -325,6 +386,13 @@ void ProgramImpl::skip_capture(CaptureOffer&& offer) {
         requests[lane].prefill.reset();
     }
 }
+
+// ============================================================================
+// 开事务：把评估结论钉成承诺（reserve）
+//
+// 两个公开入口只差"要不要顺带带上一个已经封印好的压力方案"：不带就是"只在这份评估允许的资源里做"，
+// 带了就必须做——方案里的牺牲者已经是承诺的一部分，不能再当作可选。真正的实现是 _impl。
+// ============================================================================
 
 runtime::ContextTransactionReserveStatus
 ProgramImpl::reserve_active_capture(CaptureOffer&& offer, const SharedPrefixHandle* exact_shared,
@@ -349,6 +417,18 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_wit
                                        std::move(owned), cancellation);
 }
 
+// 捕获事务的开场：验前提 → 该跳过就跳过 → 把评估数字原样钉进事务 → 认领共享槽位。
+//
+// 走向是"能跳过就跳过"：取消、没有可发布的内容、封印的压力方案已过期（物理版本或前沿对不上）、方案
+// 已经不可行、物理上装不下——全部走 skip_capture，而不是报错。只有**调用方违约**才抛异常：已经有别的
+// 上下文事务、还留着未结算的状态分叉、票据本身过期。
+//
+// 事务本体就是一份承诺：resource_delta / active_entitlement_delta / 搬运清单都取自评估，publish 时
+// 会逐项复核"实际做到的 == 当初承诺的"，不复算。共享槽位也在这里当场认领（新增用 ReservedCapture，
+// 顶替用 ReservedReplacement），免得中途被别人抢走；advance_resource_revision 的位置同样关键——从
+// 事务入册这一刻起物理世界就变了，之前封印出去的计划、压力会话里的目标全部作废。
+//
+// 中途任何一步抛异常都会先 abort_active_capture 撤掉能撤的、把捕获点划掉，再原样抛出，不留半个事务。
 runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_impl(
     CaptureOffer&& offer, const SharedPrefixHandle* exact_shared,
     const SharedPrefixHandle* replacement,
@@ -502,6 +582,20 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
     }
 }
 
+// ============================================================================
+// 流水线四段：prepare → enqueue →（publish | abort），外加发布侧的私有产物安装
+//
+// 四段像一条装配线：prepare 只把额度换成真实对象（不搬运），enqueue 只把搬运排上转移流，publish 才
+// 让结果对外可见，abort 要能从这条线的**任何一段**退回来（包括"只走了一半"和"搬运还在天上"两种
+// 情况）。因此两侧的纪律完全不同：
+//   · prepare / enqueue 的失败一律是内部违约——容量在 reserve 时已经算准，此刻只该做"必然做得到"的
+//     事，所以直接抛异常；
+//   · abort 是 noexcept 的兜底，不许再抛、也不许假设前面哪一步成功过。
+// ============================================================================
+
+// 放掉一个检查点引用，并按"实际释放了什么"如实回报：只有引用数与来源钉数都归零，那份镜像才真的被
+// 回收。这与 program_impl.h 第 10 段的 strict / best_effort 是同一套口径，而且 noexcept——走到这里
+// 已经没有上层接得住异常，只剩"做成了"和"没做成"两种事实。
 detail::PhysicalResources
 ProgramImpl::release_checkpoint_reference(StateImageHandle checkpoint) noexcept {
     detail::PhysicalResources removed;
@@ -527,6 +621,12 @@ ProgramImpl::release_checkpoint_reference(StateImageHandle checkpoint) noexcept 
     return removed;
 }
 
+// 私有产物的落地：把一个冻结的状态镜像登记成这条序列自己的检查点，并处理被顶替掉的旧检查点。
+// 两种产物各有一套容量纪律：
+//   · rewrite 检查点：一条序列只留一份，装新的就把旧的引用放掉（那份镜像能不能回收由引用数说话）；
+//   · 长锚点是一组**固定编号**的槽位（1..capacity）：满了必须明确指定牺牲哪一个（private_replacement），
+//     没满就挑一个空号填进去；两种情况下的编号都必须唯一且落在界内。
+// 返回值是"因为顶替而真的释放掉的物理资源"，供事务对账。
 detail::PhysicalResources
 ProgramImpl::install_private_capture(SequenceState& sequence, const CaptureGroup& group,
                                      StateImageHandle checkpoint,
@@ -595,6 +695,20 @@ ProgramImpl::install_private_capture(SequenceState& sequence, const CaptureGroup
     return removed;
 }
 
+// 流水线第一段：把 reserve 认领的额度换成真实设备对象，并给这次捕获定下"谁读、谁写"。
+//
+// 三件事，顺序不能换：
+//   1) 共享侧：这次若为顶替，就**当场**把旧共享前缀严格释放掉，并核对释放量确实等于当初承诺的数；
+//      若是新增，只把槽位从 ReservedCapture 继续往下推。私有侧不在这里腾地方——私有顶替的释放要等到
+//      publish（先装好新的再放旧的），所以它省下的槽位救不了眼前的峰值，这也正是评估里只把共享替换
+//      算作 reservation_credit 的原因。
+//   2) 选定目标状态镜像：Host 放置要一份"逻辑目标"（设备副本随后归活跃身份，Host 存快照）；能回收旧
+//      rewrite 检查点的镜像就回收（省一份槽位，代价是要记下代次以便回滚）；否则要一份全新的设备目标。
+//   3) 共享侧还要冻结 KV：先按前沿裁掉多余页，再给两种地址空间各留一份快照预约，以及一个新的**未激活**
+//      地址——活跃请求以后改绑到它上面继续往下写。
+//
+// 最后把源镜像冻住、开叉（read = 源，write = 目标）：活跃请求照常往目标里写，快照则从冻住的源上取。
+// 从这里开始本函数抛出的任何异常都意味着内部违约——上面每一步都依赖 reserve 时已经算准的容量。
 void ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction) {
     if (transaction.prepared || transaction.lane >= max_concurrency ||
         transaction.lane_epoch != lane_epochs[transaction.lane]) {
@@ -692,6 +806,15 @@ void ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction) 
     transaction.prepared = true;
 }
 
+// 流水线第二段：把这次捕获需要的搬运**排上转移流**（到这里仍不落任何逻辑结论）。
+//
+// 先做一次跨流交接（计算流记 source-ready、转移流等它），因为这批拷贝读的正是计算流刚写出来的东西。
+// 之后按评估给出的清单逐项排：
+//   · 状态镜像：Host 放置是 D2H 快照，掩码起草后端（DFlash / DFlash2）是设备内克隆；
+//   · KV：只搬**非对齐尾页**那一页（整页是按引用共享的，不用抄），两种 KV 各判一次，尾页拷贝计进
+//     partial_tail_cow_pages。
+// 计时只开给真的动过的资源（transfer_timer_mask 每一位对应一类资源）；最后一个事件封住整批——之后
+// progress 只看这一个事件就知道这批搬运有没有落地。
 void ProgramImpl::enqueue_active_capture_transfers(ActiveCaptureTransaction& transaction) {
     if (!transaction.prepared || !transaction.transfer_enqueue_pending ||
         transaction.transfer_submitted) {
@@ -747,6 +870,16 @@ void ProgramImpl::enqueue_active_capture_transfers(ActiveCaptureTransaction& tra
     transaction.transfer_submitted       = true;
 }
 
+// 流水线第三段（撤回侧）：把 prepare / enqueue 留下的东西尽量撤回。**可从任何一段进来**，且 noexcept
+// ——调用方可能是在异常处理里进来的，也可能是在取消路径上进来的，两种情况下都只剩"能撤多少撤多少"。
+//
+// 撤回顺序与做的时候相反：快照预约 → 两个未激活地址 → 状态镜像（分叉 / 回收 / 新目标三种情形各不同）
+// → 最后还原共享槽位的角色。lane 已经收场时状态部分整段跳过：那些对象在收场时就已经随序列一起释放了，
+// 剩下要收拾的只有共享槽位。
+//
+// 槽位角色的还原要把三个事实拼起来看：是不是顶替、旧前缀是否已经真的释放过、generation 还是不是当初
+// 那一个。顶替且已释放 → 槽位现在是空的（Free）；顶替但还没释放 → 旧前缀原样回到 Catalogued；新增
+// → 回到 Free。generation 对不上说明槽位已经被别人重新认领过，那就什么都不碰。
 void ProgramImpl::abort_active_capture(ActiveCaptureTransaction& transaction) noexcept {
     if (transaction.lane < max_concurrency &&
         active_continuations[transaction.lane] < continuation_capacity) {
@@ -815,6 +948,22 @@ void ProgramImpl::abort_active_capture(ActiveCaptureTransaction& transaction) no
     transaction.prepared = false;
 }
 
+// 流水线第四段（终段）：让这次捕获的结果对外可见，并交出终态回执。走到这里，物理动作已经全部做完，
+// 剩下的都是"改账本、发句柄"。
+//
+// 只有一条硬规则：先复核、再改账、最后才把结果交出去。复核的内容是
+//   · 票据归属（pending_capture_offer 还指着我这一张）与 lane 代次；
+//   · "实际释放的 == 当初承诺的"：removed 必须与 reserve 时钉下的 resource_delta.removed 逐项相等；
+//   · 共享槽位还停在 ReservedCapture、代次未变、槽里也还没有内容（这一项在真正写共享状态之前才查，
+//     因为它要对到"改账"的那一瞬间）。
+// 三类产物各自的落地方式：
+//   · Host 放置：先提交快照搬运，再做一次设备副本身份拆分——设备那份归继续跑的活跃身份，逻辑检查点
+//     只在 Host 上留一份账，然后把绑定切到目标镜像；
+//   · 共享：序列原来的 KV 束原样留下当检查点，活跃请求改绑到 prepare 时新建的那个地址上，再重做一遍
+//     映射前瞻（后面还要接着跑）；槽位转 Catalogued、引用计数置 1、发出带代次的句柄；
+//   · 私有：交给 install_private_capture，把状态镜像登记成 rewrite 检查点或长锚点。
+// 两本资源账（active / optional）也在这一步按评估结论挪动：这次交出去的部分从账上扣掉，而捕获新增的
+// 开销只在"只发私有、不发共享"时留在请求头上——发布成共享前缀的话，这份检查点就归公共缓存了。
 ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction& transaction) {
     if (!transaction.prepared || transaction.lane >= max_concurrency ||
         transaction.lane_epoch != lane_epochs[transaction.lane] || transaction.published) {
@@ -973,6 +1122,21 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
     return out;
 }
 
+// 捕获事务的推进机：一次调用尽量往前走，走不到终态就返回 InProgress，等 Runtime 在事件就绪后回来
+// 继续。两段流水线串在一起，顺序是死的：
+//
+//   1) 压力阶段机（只有带了压力方案才跑）：先让牺牲者把地方腾出来。HostReleases → CopyPreparation →
+//      CopiesInFlight → CopyPublication → Committed，每一步都可能在这里停下来等设备事件，phase 字段
+//      就是"上次停在哪儿"的全部记忆；共享牺牲者一律先于私有牺牲者处理，回报次序也照同一顺序。
+//   2) 捕获自己的三段：prepare → enqueue → 等 context_completion_ → publish。
+//
+// 取消检查只放在**可以安全停下的边界**上，而不是每一步之后：这些边界之前没有留下不可逆动作，所以取消
+// 一律走 abort（它同时等价于"放弃这个捕获点"，连票据和游标一起收干净）；一旦越过某个边界，那一段就
+// 必须做完。
+//
+// 两条收尾纪律：终态只发一次（published 置位后再次进来即违约）；prepare / enqueue 抛异常时先同步转移流
+// 再撤回——天上的拷贝不能比它们读写的对象活得久。中途 abort 时，牺牲者按既成事实回报：已经落定的照
+// Evicted / committed 报，没轮到的按默认值报未承诺。
 ActiveCaptureResult
 ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView cancellation) {
     ActiveCaptureTransaction* transaction_ptr =

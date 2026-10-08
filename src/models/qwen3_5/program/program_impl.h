@@ -654,6 +654,8 @@ public:
         std::optional<runtime::CheckpointRef> private_replacement, bool permit_shared_publication,
         CapturePressureCandidate&& pressure, runtime::CancellationFlagView cancellation);
     // —— 生成侧：一轮 = 一个 pending 事务 ——
+    [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
+                                                  runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
                                       std::span<const runtime::RoundBudget> budgets,
                                       runtime::ExecutionTiming* failed_timing);

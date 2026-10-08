@@ -20,9 +20,44 @@
 #include <stdexcept>
 #include <utility>
 
+// ============================================================================
+// prefill.cpp —— 预填充：把 prompt 算成设备上的事实，并采样出第一个生成 token
+//
+// 全文件分两段，职责完全不同：
+//   · execution:: 段是**一步执行**的原语：给槽位、前沿与采样配置，跑一段 prefill chunk（文本或多模态）、
+//     打一次 MTP 桥、或从单点 hidden 直接采样。它们不碰事务、不碰生命周期，算完就返回。
+//   · detail:: 段是 ProgramImpl 的预填流程：先把物化事务留下的预留装成一条活着的 lane（start_sequence），
+//     再逐块推进（advance_prefill），最后把采样到的 Begin token 挂成未结算事务，等外部裁决（resolve_*）。
+//
+// 两条贯穿全文件的位置约束：
+//   · 预填要同时维护好几个"位置"，含义各不相同，不能互相推：
+//       base   —— 本次复用了多少 token（复用前缀的长度，也叫复用前沿）；
+//       cursor —— 设备上真正算到了 prompt 的第几个 token；
+//       text_kv_valid / mtp_kv_valid / dflash_context_frontier —— 三种 KV 各自推进到了哪。
+//     cursor 只增不减；三种 KV 推进度跟在它后面（可以落后，绝不允许超过）。
+//   · 账本（ledger / prefix_identity / prefix_digests）在预填结束时恰好长 prompt_tokens + 1：多出来的
+//     那一格是刚采样出、设备还没算过的 Begin token。此时执行前沿仍停在 prompt_tokens。
+// ============================================================================
+
+// ============================================================================
+// 一步执行的原语（execution::）
+//
+// 这一段只回答"这一步怎么算"：填一张 TextContext 卡片、跑一段 chunk、把结果（推进了多少 token、是不是
+// 最后一块）交回去。谁在什么前沿上算、能不能算，都是调用方的事。
+// ============================================================================
+
 namespace ninfer::models::qwen3_5::execution {
 namespace {
 
+// DFlash 后端要把它自己那一路上下文 KV 喂饱：预填每算一块，就把这一块的目标侧特征按位置追加进去。
+// 这个函数把"追加"包成执行层要的 sink 回调——回调在算完一块时被调用，此时张量仍有效，workspace 随即
+// 复用，所以必须当场消费掉，不能攒着。
+//
+// 批量维度在这里是塌的：预填只有一条序列，append_counts 只写第 0 行的一个标量；末尾的执行包封
+// （min_count / max_count）两处填的是同一个精确值——这一块算了多少 token 是已知的，区间不浮动。
+//
+// rewrite_checkpoint 参数被显式忽略：DFlash 特征走这条回调，检查点捕获的 hidden 走卡片上另一条通道
+// （rewrite_checkpoint_hidden），两者不是一回事。
 DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
     if (!state.execution.io.dflash_decode || state.dflash_host_ingress == nullptr) {
         throw std::logic_error("DFlash prefill controls are unavailable");
@@ -42,6 +77,11 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
 
 } // namespace
 
+// 把一张 TextContext 卡片配置成"预填用"。两处要点：
+//   · 状态动作恒为 UpdateInPlace：预填就是把状态从复用点一路算到 prompt 前沿，没有"另写一份、旧的那份
+//     留着回滚"的选项——那是解码轮里投机验证才需要的。
+//   · proposal_head：执行配置声明用完整提案头时，这里显式把卡片上的提案头清空；否则要求卡片上已经装着
+//     一个优化过的提案头（没有就抛）。即"要么明确不要，要么必须真的有"，不接受来路不明的头。
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t state_source_slot,
                          std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent) {
@@ -58,6 +98,14 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
     }
 }
 
+// 跑一段预填 chunk。每次调用都**新建一张卡片**（TextContext 不缓存复用），把当前状态装上再交出去。
+// 装上并传下去的四样东西各自的含义：
+//   · 采样配置 / 状态槽位 / MTP 提案范围：由 configure_text_card 统一决定（见上）；
+//   · rewrite_checkpoint_hidden：要捕获检查点时，本块最后一个 token 的 hidden 写到哪里；
+//   · split_frontier：外部要求"这一段必须提前收尾在某处"（捕获点或改写点），-1 表示不分界。它约束的是
+//     卡片内部在哪断开，不是"这块只能算到这里"——后者由调用方用 nominal_length 控制。
+//   · DFlash sink：挂着 DFlash 后端时，算出来的特征顺路追加进它的上下文 KV。
+// 多模态版本只多一个视觉会话参数，其余完全一致。
 PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const TokenId> ids,
                                       std::uint32_t nominal_length,
                                       std::optional<std::uint32_t> split_frontier,
@@ -102,6 +150,12 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, finalize_at_end);
 }
 
+// 视觉 prompt 上的 MTP 桥接。"桥"补的是这样一件东西：MTP 后端起草下一步需要一个"上一个位置的隐藏态"，
+// 而复用一段视觉前缀时这个隐藏态不在文本 KV 里（视觉位置没有走过文本塔），得从视觉编码结果里取。
+// 于是两个前提缺一不可：桥必须正好架在复用前沿的前一个位置（position + 1 == text_kv_base），且该位置
+// 在视觉 scatter 元数据里确实对应一个视觉 token——对不上就是"要补的隐藏态根本不存在"，直接抛。
+// 位置与模态都对上之后，从视觉 chunk 的 embeddings 里按列取出这一格，作为组合输入交给桥接调用，
+// 使起草用的输入与当初预填那一格时模型的输入一致。
 void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prompt,
                            VisionPrefillSession& vision, const MtpBridgeInput& bridge) {
     if (!state.mtp_kv.valid() || bridge.previous_hidden == nullptr || state.text_kv_base == 0 ||
@@ -139,6 +193,11 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
                            bridge.rope_position, false, composed_embedding);
 }
 
+// 零后缀复用专用的采样：prompt 完全命中、没有新 token 要算，于是直接拿序列上留存的 tail hidden 走输出
+// 头 → 采样，产出 Begin token。留着这个入口的意义就是"一步都不多算也得能出 token"。
+// 前后各一次 work.reset() 是刻意的：输出头投影要用 workspace，用完立刻还回去，不在这里攒临时占用。
+// 形状校验很严（BF16、[hidden,1]）：这个 hidden 来自别处（复用来源或上一轮），必须确认它确实是目标模型
+// 的隐藏态，而不是别的什么张量。
 void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_t absolute_position,
                         std::int32_t purpose) {
     if (hidden.dtype != DType::BF16 ||
@@ -162,10 +221,19 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
 
 } // namespace ninfer::models::qwen3_5::execution
 
+// ============================================================================
+// ProgramImpl 的预填流程（detail::）
+//
+// 这一段才是"预填"本身：start_sequence 把一次物化落成活着的序列，advance_prefill 把它逐块推到 prompt
+// 前沿并采样出第一个 token，resolve_* 再把外部的裁决落到账本上。执行原语（上一段）只是被它调用的工具。
+// ============================================================================
+
 namespace ninfer::models::qwen3_5::detail {
 
 namespace {
 
+// 取某个 token 的三轴 RoPE 位置。注意 positions 是**三个平面首尾相接**的一维数组（第 i 轴从
+// i * tokens 处起算），不是 [3, tokens] 那样的二维布局；长度校验 3 * tokens 就是这个意思。
 std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& prompt,
                                                  std::uint32_t token);
 
@@ -181,6 +249,32 @@ std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& promp
 
 } // namespace
 
+// ============================================================================
+// start_sequence —— 物化事务的物理发布点（把预留装成一条活着的 lane）
+//
+// 走进这里时，物化事务已经攒下一堆"已认领但还不算数"的东西：状态镜像的预留与 fork 目的地、主 KV 与
+// 后端 KV 的地址空间（可能是新造的，也可能是 COW 出来的）、两种 KV 的页额度、待落地的前缀身份。
+// 这个函数把它们一次性装到 lane 上；返回之后，这条序列就有了 KV、状态与账本，可以开始预填。
+//
+// 按复用路径分派成四种装法，**互不共用**：
+//   · Root：全新序列。旧的 KV / 状态一律释放，直接接管事务留的 root 地址空间，账本清空从头写。
+//   · Retain（保留来源）：来源（目录里的私有续跑，或共享前缀）要留着继续被别人用，目的地是新的一份。
+//     状态按来源副本的落地情况分三种走法（就地指过去 / 只分裂设备副本身份 / 真 fork 并挂 fork_pending）；
+//     共享来源还要把引用计数 +1。
+//   · PrivateEndpoint / 检查点恢复：来源就是本 lane 已经持有的那一份（resident），接管方式由
+//     activate_consumed_state 决定是"整份挪过来（Move）"还是"从检查点 fork"。
+//   · 其余路径直接抛——这里不接受任何计划外的复用路径。
+//
+// 三处容易看漏的地方：
+//   · 不保留来源时，目的地地址空间的旧尾部要先**破坏性裁掉**，而且先 preflight 再动手：能不能裁是几何
+//     性质（尾部页的列数能否释放、Host 副本能否原子回收），不是"失败了再回滚"的动作。
+//   · 前缀 COW 一旦 commit，源地址空间当场释放——这是"新地址空间顶替旧来源"的那一步。
+//   · 结尾把物化期攒的 ledger / prefix_identity / prefix_digests **swap** 进来（不是拷贝）：那三个数组
+//     本来就是物化期的暂存，换手之后暂存即空。
+//
+// 失败语义：整段是"要么全成、要么整条拆掉"。catch 里先同步设备，再 best-effort 清 lane，然后原样抛出；
+// 所以它不 noexcept，失败后 lane 回到 Empty（清理是尽力而为，不保证资源全部回池）。
+// ============================================================================
 void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                                  MaterializationTransaction& transaction) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
@@ -207,6 +301,8 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             transaction.source_mode == runtime::PrivateSourceMode::Retain;
         const bool text_prefix_fork    = request_plan.text_prefix_fork_required;
         const bool backend_prefix_fork = request_plan.backend_prefix_fork_required;
+        // 装法从这里分岔。每个分支开头都是同一件事：把"这一步成立的前提"整组核对一遍（缺一项就抛），
+        // 核对的全是"事务当初承诺的东西现在是否还在、形状是否还对得上"。
         if (request_plan.reuse == ReusePath::Root) {
             if (transaction.reserved_state_count != state_slots || state_slots == 0 ||
                 !transaction.root_text_address || !transaction.text_activation ||
@@ -235,6 +331,8 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             }
             sequence.kv.emplace(bundle);
         } else if (preserving_source) {
+            // 保留来源时，来源要么是私有续跑、要么是共享前缀，**恰有其一**：两者同真或同假都是错的
+            //（private_source_ready == shared_source_ready 就是这个意思）。
             const bool private_source_ready = transaction.has_source &&
                                               transaction.source_index < continuation_capacity &&
                                               continuation_slots[transaction.source_index].role ==
@@ -258,6 +356,12 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                                      request_plan.reuse, request_plan.selected_checkpoint)
                     : shared_prefix_states[transaction.shared_source_index].state;
             const StateImageHandle current = transaction.reserved_states[0];
+            // 来源副本落在哪，决定目的地怎么装：三种情况处理的都是同一件事——"来源那份状态不能被就地
+            // 改坏"，区别只在省多少搬运。
+            //   · 来源只在 Host：目的地那份活跃副本已经是独立的一份，直接指过去；
+            //   · 身份分裂（split_state_identity）：源与目的地共用同一份设备副本，只把身份拆成两个；
+            //   · 其余：走 begin_fork，先把读侧锁在来源上、写侧落在目的地，由 fork_pending 记着还没
+            //     真正分家，等第一次真的要写状态时才落定。
             if (state_store->residency(selected) == StateReplicaResidency::HostOnly) {
                 if (state_store->role(current) != StateImageRole::ActiveMutable) {
                     throw std::logic_error("Host retained Fork destination was not published");
@@ -316,6 +420,10 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             }
         }
 
+        // 不保留来源时，目的地的旧尾部必须**破坏性裁掉**：复用只覆盖到某个前沿，前沿之后留着的是上一次
+        // 在这个地址空间里算出来的内容，不清干净就不配当新序列的底子。
+        // 裁之前先做 preflight，是因为"能不能裁"是几何性质（尾部页的列数是否正好可释放、Host 副本能否
+        // 原子回收），而裁本身已经是不可逆的物理动作——先把不可行的情形挡在前面，别做到一半才发现。
         if (!preserving_source) {
             std::array<HostKVPageReplicaRelease, 2> stale_tail_replicas{};
             std::size_t stale_tail_count           = 0;
@@ -394,6 +502,8 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
         if ((text_prefix_fork || backend_prefix_fork) && !transaction.prefix_forks_ready) {
             throw std::logic_error("materialization prefix forks are incomplete");
         }
+        // 前缀 COW 的提交点：commit_prefix_fork 把新地址空间接上，源地址空间随即可以释放——不保留来源
+        // 时这里当场释放它。后端 KV 同理，只是它可能压根不存在（backend 是 optional）。
         if (text_prefix_fork) {
             text_kv_addresses->commit_prefix_fork(std::move(*transaction.text_prefix_fork),
                                                   device.stream);
@@ -435,6 +545,10 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
 
         const bool preserve_rewrite =
             request_plan.rewrite_disposition == RewriteCheckpointDisposition::RetainExisting;
+        // 把一份"被消费掉的检查点"接管成活跃状态，两种方式取决于计划里那份 checkpoint 是要被吃掉
+        //（Move：整份挪过来，挪之前必须确认没有别的引用）还是留着（Fork：写侧落到目的地，读侧仍在
+        // 检查点上）。fork 时还要算清读侧所有权——引用全在本序列血统之内才算 LineageCheckpoint，否则
+        // 是外部还握着，读侧不能被当成"自己人"看待。
         const auto activate_consumed_state = [&](StateImageHandle selected) {
             if (!request_plan.state_fork_required) {
                 if (transaction.state_fork_destination ||
@@ -480,6 +594,9 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             }
             transaction.state_fork_destination.reset();
         };
+        // 第二次按复用路径分岔，这次定的是**逻辑起点**：账本长度、三种 KV 推进度、末尾 hidden 是否可用、
+        // 以及共享来源的引用计数。物理装法在上面，逻辑起点在这里，两者必须对得上（对不上就在各自的校验
+        // 里抛）。每个分支最后都把 state 视图与 KV 绑定刷新一遍——上面的物理改动到此对执行层可见。
         if (request_plan.reuse == ReusePath::Root) {
             sequence.rewrite_checkpoint = {};
             ordered_reset(sequence);
@@ -627,6 +744,9 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             throw std::logic_error("request plan has an invalid prefix reuse path");
         }
 
+        // 收口：新序列此刻还没有"可发布的端点"（endpoint_valid = false）；两种 KV 先按 base 收齐，再把整
+        // 句长度所需的页覆盖铺出来。覆盖是**下界**语义（可能早已映射得更远，只有显式 truncate 才会收回），
+        // 决定哪些 token 有效的是 commit_frontier，不是映射宽度。
         sequence.endpoint_valid = false;
         if (!preserving_source) { trim_sequence_kv(sequence, base, backend_kv_valid(sequence)); }
         bind_sequence_kv(sequence);
@@ -637,10 +757,15 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                 : 0U;
         ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
+        // 采样配置与 rope_delta（位置偏移，复用来的 KV 靠它对齐绝对位置）在这里装上：两者一装，这条序列
+        // 在数值上的接续关系就定了。
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
 
+        // 请求侧控制状态清零重来：上一手残留在 RequestControl 里的统计与未结算事务一律不带进来。
+        // tail_hidden（末尾 hidden，零后缀复用与检查点靠它）只在整句都复用时才有意义。
+        // 物化期攒下的三个数组在这里 swap 进来——它们本来就是物化期的暂存，换手之后暂存即空。
         request.timings              = {};
         request.pending              = {};
         request.publish_continuation = request_plan.summary.publish_continuation;
@@ -652,6 +777,8 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
         sequence.rebuild_work       = request_plan.root_rebuild_work;
         sequence.rebuild_tail_begin = request_plan.root_rebuild_tail_begin;
 
+        // DFlash 后端的 ingress 是一小份主机侧描述（活跃 lane、状态源/目的地槽位、后端 KV 的表行），解码
+        // 每轮都会重新下发。预填只有一条序列，所以这里只填第 0 行，真正提交给设备是后面推进时的事。
         if (is_masked_draft_backend(speculative_backend)) {
             if (!dflash || !io.dflash_decode || (backend_kv_cache() && !sequence.kv->backend)) {
                 throw std::logic_error("DFlash prefill state is incomplete");
@@ -669,8 +796,12 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
         }
 
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
+        // 全部装完才转 Prefilling —— 这个生命周期就是"这条序列可以被推进"的开关；在中途置上它，外部就
+        // 可能看见一条还没装好的序列。
         request.lifecycle = Lifecycle::Prefilling;
     } catch (...) {
+        // 失败退场：先把设备上已经发出去的工作同步掉（否则随后释放资源会与在飞的 kernel 打架），再
+        // best-effort 清 lane，最后原样抛出。清理只求别崩、别漏，不保证资源全部回池。
         try {
             device.synchronize();
         } catch (...) {}
@@ -679,12 +810,16 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
     }
 }
 
+// 两个薄壳入口：把 lane 翻成序列引用，真正的推进与结算在下面。之所以要这层壳，是因为对外的执行入口只
+// 拿得到 lane 号（句柄合法性已经在 contract 那一层验过），而内部只谈"哪条序列"。
 runtime::PrefillStepResult
 ProgramImpl::advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     return advance_prefill(active_sequence(lane), requests[lane], failed_timing);
 }
 
+// 单行的非投机结算：这一行挂着的必须是 Begin（预填产出的那一个 token），然后接受它。当前树内没有调用
+// 者——产品路径一律走由 commit 驱动的批量 resolve_pending_raw，这里保留的是同一件事的单行入口。
 runtime::ExecutionTiming ProgramImpl::resolve_prefill_raw(std::uint32_t lane, bool terminal,
                                                           runtime::ExecutionTiming* failed_timing) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
@@ -695,6 +830,26 @@ runtime::ExecutionTiming ProgramImpl::resolve_prefill_raw(std::uint32_t lane, bo
                                            std::nullopt, failed_timing);
 }
 
+// ============================================================================
+// resolve_pending_raw —— 把外部的裁决落进账本（批量的结算点）
+//
+// 输入是 Runtime 对每一行的裁决（接受几个 token、是否终止、是否取消）与执行切分边界；完成后各行都有新
+// 的前沿与去向（Active / Finishable / 已释放）。按"这一批是什么"分三条路：
+//   1) 单行且是 Begin：预填那一行。取消 → 严格释放整条；否则接受它唯一那个 token。
+//   2) 没有投机后端：逐行独立处理，取消的释放、其余的走 resolve_non_speculative_pending。
+//   3) 有投机后端：先批量把设备侧状态重放/回卷到接受范围（replay_fold），再逐行落账。
+//
+// 硬约束（第 3 条路里逐行复核，其余路径在各自的落地函数里复核）：
+//   · 每一行必须仍在它自己记录的出发点上：执行前沿、三个账本数组的长度、三种 KV 推进度，全部要等于
+//     pending.base_E / base_S。中途被别人动过就抛——绝不"按现值推断"。
+//   · 取消 ⇒ 接受 0 个；非取消 ⇒ 至少接受 1 个；非取消且不终止 ⇒ 必须全收。于是"只收一个前缀"唯一
+//     合法的形状是：非取消 + 终止 + 前缀非空。
+//   · 部分接受 + 终止时，留存的 hidden 取被接受的那一个（committed - 1），不是产出的最后一个。
+//
+// 推进分两段，中间隔着一次 device.synchronize()：前段是设备侧动作（状态重放、稀疏统计发布、hidden
+// 修正、DFlash 上下文补录），后段是纯主机侧落账。任一段失败 → 整批 lane 走 clear_execution_failure_
+// lanes：一行出事整批作废，不允许留下"半批已结算"。
+// ============================================================================
 runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     std::span<const std::uint32_t> lanes, std::span<const std::uint32_t> accepted_tokens,
     std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> cancelled,
@@ -707,6 +862,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         throw std::invalid_argument("pending batch resolution has inconsistent membership");
     }
 
+    // ① 预填那一行：Begin 事务只产出一个 token，裁决只有"要"或"取消"两种。
     if (lanes.size() == 1 && lanes.front() < max_concurrency &&
         requests[lanes.front()].pending.kind == PendingKind::Begin) {
         const std::uint32_t lane = lanes.front();
@@ -730,6 +886,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         return timing.finish();
     }
 
+    // ② 没有投机后端：每行彼此独立，接受范围就是它自己的产出范围，逐行落地即可。
     if (speculative_backend == SpeculativeBackend::None) {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const std::uint32_t lane = lanes[row];
@@ -756,6 +913,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         throw std::logic_error("speculative pending batch has no ReplaySSM records");
     }
 
+    // ③ 有投机后端：状态必须先按接受范围重放或回卷，一行一次。GdnReplayFoldRow 逐行给出状态槽位与该行
+    // 要保留的列数（commit_columns）——取消行是 0，等于把状态整个退回本轮起点。
     std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold_rows{};
     std::array<std::int32_t, kMaximumConcurrency> hidden_selectors{};
     bool needs_hidden_correction = false;
@@ -767,6 +926,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         }
         const PendingCandidate& pending = requests[lane].pending;
         const SequenceState& sequence   = active_sequence(lane);
+        // "这一行还在出发点上吗"：执行前沿、三个账本数组的长度、三种 KV 推进度，全部要等于本轮开始时
+        // 记录的值。少对上一个，就说明有人在中途动过这条序列。
         if (sequence.execution_frontier != pending.base_E ||
             sequence.ledger_frontier != pending.base_S ||
             sequence.ledger.size() != pending.base_S ||
@@ -779,6 +940,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
              sequence.dflash_context_frontier != pending.base_E)) {
             throw std::logic_error("speculative pending row is not at its recorded base");
         }
+        // 裁决的形状在这里先验一遍，验过才允许动手改设备状态。
         const std::uint32_t committed = cancelled[row] ? 0U : accepted_tokens[row];
         if ((cancelled[row] && accepted_tokens[row] != 0) ||
             (!cancelled[row] && (committed == 0 || committed > pending.produced ||
@@ -790,6 +952,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             ops::GdnReplayFoldRow{.source_state_slot      = selectors.source,
                                   .destination_state_slot = selectors.destination,
                                   .commit_columns         = static_cast<std::int32_t>(committed)};
+        // 只有"非取消 + 终止 + 只收前缀"这一种形状需要换 hidden：真正的新前沿是被接受的那一格，留存的
+        // hidden 必须跟着换成它，否则下一步或检查点就会拿着一个没被接受的位置的 hidden。
         const bool partial_terminal =
             !cancelled[row] && terminal[row] && committed < pending.produced;
         hidden_selectors[row] =
@@ -803,7 +967,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         replay_fold->execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                              device.stream);
 
-        // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.
+        // 稀疏接受时统计读的是授权前缀：Frontend 放行了多长，就只把这一段发布进 token_counts——惩罚计数
+        // 只该计入真正被采纳的 token，不能把整个草稿窗口都算上。
         if (speculative_backend == SpeculativeBackend::DFlash2) {
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 if (cancelled[row] || !requests[lanes[row]].sampling_host.token_counts) {
@@ -821,6 +986,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             }
         }
 
+        // 需要换 hidden 的行：把选中的那一格隐藏态改成状态槽位上留存的那份（两处 hidden 缓冲的取法按
+        // 后端不同，但做的事一样），再按目的地槽位散写回去。
         if (needs_hidden_correction) {
             const auto batch = static_cast<std::int32_t>(lanes.size());
             Tensor selector_tensor;
@@ -851,6 +1018,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                          device.stream);
         }
 
+        // DFlash：已经终结的行要把这次接受的那些位置补进它自己的上下文 KV——终结之后不会再有解码轮，
+        // 只能在这里补上；没终结的行留在 base 上，等下一轮解码自己往前走。
         if (is_masked_draft_backend(speculative_backend)) {
             std::array<std::uint32_t, kMaximumConcurrency> append_lanes{};
             std::array<std::uint32_t, kMaximumConcurrency> append_starts{};
@@ -877,6 +1046,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         timing.end_wait();
         work.reset();
     } catch (...) {
+        // 设备侧失败：清掉 workspace、整批 lane 一起退场，再抛。已经发出去的 kernel 不试图挽回——同步完
+        // 就让整批作废。
         try {
             device.synchronize();
         } catch (...) {}
@@ -885,6 +1056,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         throw;
     }
 
+    // 设备侧那一半到此为止，tail_seconds 是它的耗时（最后按行摊进统计）。下面这一段是纯主机侧的落账：
+    // device.synchronize() 已经上过，这里读到的都是设备确实写完的事实。
     const double tail_seconds = std::chrono::duration<double>(Clock::now() - tail_started).count();
     const std::uint32_t width = draft_window + 1U;
     try {
@@ -900,6 +1073,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
 
             const PendingCandidate pending = request.pending;
             const std::uint32_t committed  = accepted_tokens[row];
+            // 落账的前提是"状态与账本对齐"：挂着的 fork 必须先落地，否则账本指向的位置与状态实际写在
+            // 哪里会对不上。
             settle_state_fork(sequence);
             const TokenId* token_base =
                 speculative_backend == SpeculativeBackend::Mtp
@@ -909,7 +1084,11 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             commit_generated_prefix_identity(sequence, pending.base_S,
                                              std::span<const TokenId>(token_base, committed),
                                              prefix_execution_splits[row]);
+            // 重算账同步推进：这段位置是（部分）重算出来的，重建进度要跟着新的执行前沿走。
             advance_rebuild_work(sequence, pending.base_E + committed, prefill_chunk);
+            // 三个前沿一起推进：执行前沿（设备算到哪）、账本前沿（记到哪）、主 KV 推进度。投机轮接受的是
+            // **已经算过**的 token（验证过程本身就是目标模型在算），所以账本与执行同步前进——不像非投机
+            // 轮那样账本要多出一格"已知但还没算"的 token。
             sequence.execution_frontier = pending.base_E + committed;
             sequence.ledger_frontier    = pending.base_S + committed;
             sequence.text_kv_valid      = sequence.execution_frontier;
@@ -932,6 +1111,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                     terminal[row] ? sequence.execution_frontier : pending.base_E;
             }
 
+            // KV 收口：先提交推进到的位置（决定哪些 token 有效），再把越界保留的尾部裁掉。
             commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
             trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
             if (terminal[row]) {
@@ -940,15 +1120,40 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 request.lifecycle = Lifecycle::Active;
             }
             request.pending = {};
+            // 设备侧那半段是按批算的，按行摊进各自的时间统计。
             request.timings.decode_seconds += tail_seconds;
         }
     } catch (...) {
+        // 落账阶段失败：已经写好的那几行也不保留——整批走同一条路，不留"半批已结算"。
         clear_execution_failure_lanes(lanes);
         throw;
     }
     return timing.finish();
 }
 
+// ============================================================================
+// advance_prefill —— 推进一段预填（这个文件的主线）
+//
+// 三个阶段：可能先给 MTP 打桥（复用的后缀之前要先把 MTP 状态对齐到复用点）、然后按 prefill_chunk 分块
+// 把 prompt 算完、最后采样出第一个生成 token 并把这一行挂成未结算事务（PendingKind::Begin）。
+//
+// 三种推进形态：
+//   · 零推进 + 捕获点就在当前 cursor（0-prefill 共享提升）：一个 token 都不算，直接递一张捕获票据返回；
+//   · cursor < prompt_tokens：真正跑 chunk，每块推完 cursor 与三种 KV 推进度；碰到捕获前沿就递票据返回
+//    （除非这块已经 finalize——最终块的采样还没被结算，票据得等 Begin token 落账之后再由 commit 递）；
+//   · cursor == prompt_tokens（零后缀）：不跑 chunk，直接用留存的 tail hidden 采样。
+//
+// 三个约束：
+//   · 同一时刻只允许一张未决的捕获票据（pending_capture_offer）：外部对每个捕获点是**逐个**作决定的，
+//     一次捕获的取舍不允许打断其他捕获点的判断。
+//   · 切分前沿取"捕获点"与"改写点"里更早的那个：两者都要求 chunk 边界，一个是递票据的位置，一个是
+//     分开写状态的位置。
+//   · 结束时账本长度必须正好是 prompt_tokens（校验在推入之前），推入 Begin token 后变成 prompt_tokens+1，
+//     而执行前沿仍停在 prompt_tokens。
+//
+// PrefillStepResult.complete 只在"已经采样出 Begin token"时为 true；中途停下的返回都是未完成的一步，
+// 调用方得再调一次。
+// ============================================================================
 runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                                         RequestControl& request,
                                                         runtime::ExecutionTiming* failed_timing) {
@@ -958,6 +1163,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     }
 
     RequestControl::Prefill& staged = *request.prefill;
+    // 上一张捕获票据还没被消化就不能再推进：捕获的取舍是外部逐个作的，这边抢跑到下一个捕获点会把那个
+    // 判断顺序打乱。
     if (staged.pending_capture_offer != 0) {
         throw std::logic_error("prefill cannot advance while a capture offer is pending");
     }
@@ -967,6 +1174,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {
+        // 零推进的捕获点：cursor 还停在 base 上，而这里恰好是一个捕获候选。一个 token 都不用算——直接把
+        // 票据递出去，让外部决定要不要在这里留一份共享前缀（这就是"0-prefill 共享提升"）。递之前先确认
+        // 它在形状上确实是共享基础提升，而不是改写点或长锚点——后者本不该在零推进时被递出去。
         if (staged.next_capture < staged.capture_groups.size() &&
             staged.capture_groups[staged.next_capture].frontier == staged.cursor) {
             if (staged.cursor != staged.base ||
@@ -975,6 +1185,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 staged.capture_groups[staged.next_capture].long_anchor) {
                 throw std::logic_error("zero-prefill capture is not a shared base promotion");
             }
+            // 票据 id 从 1 起（0 表示"没有票据"），回绕时跳过 0。
             if (++next_capture_offer_id_ == 0) { ++next_capture_offer_id_; }
             staged.pending_capture_offer = next_capture_offer_id_;
             return runtime::PrefillStepResult{
@@ -985,6 +1196,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         StateImageSelectors selectors = state_selectors(sequence);
         Tensor rewrite_capture_hidden;
         Tensor* rewrite_capture_hidden_ptr = nullptr;
+        // 后面还有捕获点，就先把"hidden 写到哪"准备好：本块最后一个 token 的隐藏态要顺路写进目的地上，
+        // 捕获要拿它当检查点的隐藏态。
         if (staged.next_capture < staged.capture_groups.size()) {
             rewrite_capture_hidden = state_images->continuation_hidden_slot(selectors.destination);
             rewrite_capture_hidden_ptr = &rewrite_capture_hidden;
@@ -1007,6 +1220,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             staged.initial_mtp_extent,
             dflash_host_ingress};
 
+        // 打桥：把 MTP 状态在**复用点之前**对齐（position 是 base-1 那个位置），对齐之后 mtp_kv_valid 才能
+        // 推到 base。视觉 prompt 的桥还要额外从视觉编码里补出那个位置的隐藏态（见 mtp_bridge_multimodal）。
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
                 staged.cursor >= staged.prompt_tokens) {
@@ -1035,6 +1250,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             staged.mtp_bridge = MtpBridgeMode::None;
         }
 
+        // 还有 prompt 没算：分块推进，每块最多 prefill_chunk 个 token，直到 prompt 全部算完。
         if (staged.cursor < staged.prompt_tokens) {
             const std::uint32_t nominal =
                 std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
@@ -1065,6 +1281,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                         ? std::optional<std::uint32_t>(
                               staged.capture_groups[staged.next_capture].frontier)
                         : std::nullopt;
+                // 切分前沿取两者更早的那个：捕获点要求"跑到这里就得停下来递票据"，改写点要求"状态在这里
+                // 分开写"。两者都只能落在 chunk 边界上。
                 std::optional<std::uint32_t> split_frontier = capture_frontier;
                 const auto rewrite_split                    = std::upper_bound(
                     staged.prompt.identity.rewrite_execution_frontiers.begin(),
@@ -1090,6 +1308,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
                 timing.include(result.timing);
                 timing.resume_post();
+                // 实际吃掉的 token 可能少于 nominal（被切分点或视觉块边界提前收尾），调用方必须按它推进
+                // 游标；合法区间是 (0, remaining]——0 是没进展，超过 remaining 是越界。
                 if (result.processed_tokens == 0 || result.processed_tokens > remaining) {
                     throw std::logic_error("ordinary prefill chunk made invalid progress");
                 }
@@ -1098,6 +1318,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 processed_prompt_tokens += result.processed_tokens;
                 remaining -= result.processed_tokens;
                 final_chunk_tokens     = result.processed_tokens;
+                // cursor 与三种 KV 推进度一起前进，KV 随即在地址空间上提交一次：这样即使中途停下递票据，
+                // 设备上的状态也是自洽的。
                 sequence.text_kv_valid = staged.cursor;
                 if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
                 if (is_masked_draft_backend(speculative_backend)) {
@@ -1105,14 +1327,14 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
 
-                // Prompt transitions are canonical immediately. If this was the first write after
-                // an immutable source, close the Fork before potentially freezing a new rewrite.
+                // 预填推进到哪，哪里就成为"已经是事实"的位置：如果这是从不可变来源接过来的第一次写，要
+                // 在这里先把 fork 合上，之后才谈得上冻结出一份新的改写检查点。
                 settle_state_fork(sequence);
                 const bool reached_capture = capture_frontier && staged.cursor == *capture_frontier;
                 if (reached_capture) {
                     if (result.finalized) {
-                        // The prompt-frontier state becomes publishable only after the generated
-                        // Begin token is committed. commit() emits the offer for this group.
+                        // 块本身已经 finalize（刚采样），票据不能现在递：prompt 前沿上的状态要等 Begin
+                        // token 被结算之后才算可发布，那一张票据由 commit 递出去。
                     } else {
                         staged.elapsed_seconds +=
                             std::chrono::duration<double>(Clock::now() - started).count();
@@ -1130,6 +1352,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 if (finalized || remaining == 0) { break; }
             }
 
+            // 没跑完（prompt 还有剩）：返回一个未完成的一步，调用方接着调。
             if (!finalized) {
                 if (staged.cursor == staged.prompt_tokens) {
                     throw std::logic_error("staged prefill reached the prompt without sampling");
@@ -1145,10 +1368,15 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             if (staged.cursor != staged.prompt_tokens) {
                 throw std::logic_error("staged prefill sampled before the prompt frontier");
             }
+            // 最终块算完并采样之后，把这一块最后一个 token 的 hidden 留下当序列的末尾 hidden——零后缀复用
+            // 与检查点都靠它。
             timing.resume_submit();
             copy_tail(sequence, prefill_hidden.slice(
                                     1, static_cast<std::int32_t>(final_chunk_tokens) - 1, 1));
         } else {
+            // 零后缀（cursor == prompt_tokens）：prompt 全部复用命中，不跑 chunk，直接拿留存的 tail hidden
+            // 走输出头采样。MTP 时还要在命中点之后再打一次桥（AfterExactHit），把 MTP 状态推到 prompt
+            // 前沿，顺带按 initial_mtp_extent 决定要不要现在就起草（> 0 才起草）。
             mark_workspace_usage(workspace_plan.ordinary_round);
             if (!sequence.tail_hidden_valid) {
                 throw std::logic_error("zero-suffix reuse has no target tail hidden");
@@ -1189,6 +1417,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         const double vision_seconds       = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
         const std::uint32_t prompt_tokens = staged.prompt_tokens;
 
+        // 采样结果落账。顺序是刻意排的：先校验 token 落在公开词表内、再确认账本长度正好是 prompt_tokens
+        // ——两条都成立才允许推入这个 Begin token，于是账本变成 prompt_tokens + 1 而执行前沿不动。
+        // 身份与摘要这里只写"刚采到这枚 token"的**临时**记录：按外部裁决补齐或重写是 commit 阶段的事。
         validate_licensed_tokens(std::span<const TokenId>(host_tokens, 1));
         if (sequence.ledger.size() != prompt_tokens) {
             throw std::logic_error("candidate token ledger does not match prompt length");
@@ -1215,10 +1446,13 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         staged.prompt.release_all_media_payloads();
         if (staged.vision) { staged.vision->retire_handoff(); }
 
+        // prompt 前沿本身就是一个捕获点时，预填暂存要留着——那张票据还没递出去，得等 commit 用它来递；
+        // 否则预填的暂存到此结束。
         const bool prompt_frontier_capture =
             staged.next_capture < staged.capture_groups.size() &&
             staged.capture_groups[staged.next_capture].frontier == prompt_tokens;
         if (!prompt_frontier_capture) { request.prefill.reset(); }
+        // 这一行挂成未结算的 Begin 事务：base_E / base_S 都是 0（这是序列的第一步），produced = 1。
         request.pending   = PendingCandidate{.kind          = PendingKind::Begin,
                                              .base_E        = 0,
                                              .base_S        = 0,
@@ -1233,6 +1467,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             .timing                  = timing.finish(),
         };
     } catch (...) {
+        // 失败退场：同样先把在飞的工作同步掉再清 lane（这次只涉及一条 lane），然后原样抛出。
         timing.begin_wait();
         try {
             device.synchronize();

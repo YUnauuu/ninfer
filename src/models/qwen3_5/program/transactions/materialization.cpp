@@ -19,9 +19,28 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
+// ============================================================================
+// 物化事务 —— 一次请求"落位"的完整流水线
+//
+// 输入是一份已经封印好的准入候选（AdmissionCandidate：它说清了要复用谁、要腾掉谁、要占多少资源），
+// 输出是一个已经发布、可以开始预填充的请求。中间要跨过三道坎，也是本文件的三个大块：
+//   1) 压力：把候选里承诺腾出的空间真正腾出来（牺牲者逐出、副本降级/丢弃、checkpoint 丢弃）；
+//   2) 搬运：把要复用的状态与 KV 恢复到设备上（Host→Device 恢复、前缀 COW、状态 fork）；
+//   3) 落位：建立序列状态、装采样配置，最后在唯一那个发布点交给 Runtime 的目录。
+//
+// 三条贯穿全文件的性质：
+//   · **可中断但不可抢占**：取消只在阶段边界生效（每个阶段末尾查一次 cancel_pending）。已经物理提交的
+//     部分不回滚——压力阶段丢掉的 Host 副本不会因为随后的取消而回来，剩下的只是不再往前走。
+//   · **每步都可以重来**：progress 是幂等的状态机，同一个阶段被反复调用不会重复提交；每个"已提交"
+//     标志（submitted / published / prepared）就是这条幂等性的支点。
+//   · **事务不会半途消失**：要么走到 Published，要么走 Aborted，两者都会把牺牲者与来源的账补齐再交回。
+// ============================================================================
 runtime::ContextTransactionReserveStatus
 ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptData&& prompt,
                                      runtime::CancellationFlagView cancellation) {
+    // 建立事务这一段的整体职责：把候选"冻结"成事务现场——候选此后即使被外部改坏也不影响执行，
+    // 事务只按封印时的样子走。这里做的校验属于"最后一刻复核"：封印之后到真正动手之间，来源序列的
+    // 前缀、checkpoint、捕获身份、媒体载荷都可能已被别人动过。
     if (cancellation.requested()) { return runtime::ContextTransactionReserveStatus::Aborted; }
     const runtime::PreflightStatus preflight = revalidate_materialization(plan, prompt);
     if (preflight != runtime::PreflightStatus::Ready) {
@@ -64,6 +83,10 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
             source_state->long_anchors.size());
     }
     if (shared_state != nullptr) { transaction.shared_source_result.emplace(); }
+    // 把候选里的压力动作逐条物化成事务自己的工作记录（每项一个 PressureWork）。这里就把"谁是被牺牲
+    // 者"以及"它当时是哪一个（下标 + 代次）"钉死：后面每一步动作前都要复核这一对，代次不符说明牺牲者
+    // 已经换人，动作必须作废而不是作用到别人身上。来源自己被选成牺牲者、或同一个牺牲者被选两次，都是
+    // 候选本身的错误，在这里直接报出来。
     const std::size_t victim_count        = details.pressure_options.size();
     const std::size_t shared_victim_count = details.shared_pressure_options.size();
     transaction.victim_count              = victim_count;
@@ -154,6 +177,9 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
     }
     if (transaction.id == 0) { transaction.id = next_materialization_id_++; }
 
+    // 根请求（没有来源，或者来源是"保留"而不是"吃掉"）需要一个新落脚点：找一个空闲的续跑槽先占上。
+    // 一个都找不到时，只能指望压力阶段真的逐出某个续跑——此时把落脚点押在它身上，但要等逐出完成才
+    // 能真正占位（root_waiting_for_victim），因为"逐出"本身也可能在这之前失败。
     if (!details.has_source || details.source_mode == runtime::PrivateSourceMode::Retain) {
         for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
             if (continuation_slots[index].role != ContinuationSlotRole::Free) { continue; }
@@ -181,6 +207,9 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
     transaction.plan.emplace(std::move(plan));
     AdmissionCandidateImpl& request_plan = *transaction.plan->impl_;
     RequestControl& request              = requests[lane];
+    // 最后一刻复核（从候选封印到此刻之间，世界可能变了）：提示词与计划必须互相描述；复用路径要选的
+    // 来源仍在且前缀仍匹配；选中的 checkpoint / 捕获身份仍然可用；要保留的改写点仍然保留得住。任何
+    // 一条不成立都说明这份候选已经过期，宁可作废也不按错的前提动手。
     try {
         const std::uint32_t prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
         if (prompt_tokens != request_plan.summary.prompt_tokens ||
@@ -339,6 +368,8 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
             .reuse              = request_plan.reuse,
             .mtp_bridge         = request_plan.mtp_bridge,
         };
+        // 请求的预填充簿记在这里就建立（还没开始跑），物品级的视觉会话也一并建好。游标先停在 reuse_base：
+        // 前缀部分靠复用，从复用点之后才开始真正算。
         request.prefill.emplace(std::move(prefill));
         if (request.prefill->vision_plan) {
             if (!workspace_plan.vision) {
@@ -361,6 +392,8 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
             }
             destination.role = ContinuationSlotRole::ReservedMaterialization;
         }
+        // 事务正式开工。递增 resource_revision 是必须的：从这一刻起物理世界多了一批"已预订但还没用"
+        // 的资源，之前算出的任何压力方案与封印计划都以旧版本为准，必须作废。
         advance_resource_revision();
         context_transaction_.emplace<MaterializationTransaction>(std::move(transaction));
         return runtime::ContextTransactionReserveStatus::Reserved;
@@ -370,6 +403,9 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
     }
 }
 
+// 事务的退场：把这次动作已经做出去的东西收回来——先中止还没走完的压力动作（其中已提交到传输流的要
+// 先等流结束），再归还事务持有的全部物理预订（地址空间、状态槽、设备页预留、Host 区间）。这是
+// "构造失败"与"中途取消/失败"共用的那条路径，所以它必须能容忍事务停在任何进度上。
 void ProgramImpl::release_materialization_staging(
     MaterializationTransaction& transaction) noexcept {
     const std::uint32_t lane = transaction.destination.value;
@@ -444,6 +480,12 @@ void ProgramImpl::release_materialization_staging(
     materialization_prefix_digests_.clear();
 }
 
+// "吃掉来源"（ConsumeToActive）的语义：新请求直接继承来源的落脚点，来源序列本身退化成"只到
+// reuse_base"。于是要把 reuse_base 之后的一切从来源上摘掉——状态镜像、长锚点、改写 checkpoint、
+// KV 尾段——而 reuse_base 之前的必须原样留下（正是新请求要复用的那部分）。
+//
+// 这里的每一步都在释放"原本会被算作来源独占资源"的东西，所以最后要拿结果跟候选当初承诺的
+// demand.final_removed 对账：对不上说明释放的范围与承诺不符，必须报出来而不是默默接受。
 void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transaction) {
     if (transaction.source_prepared || !transaction.plan || transaction.plan->impl_ == nullptr) {
         throw std::logic_error("materialization source preparation state is invalid");
@@ -483,6 +525,8 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
         }
     };
 
+    // 只有"不再被别处引用"的镜像才真能释放：端点在用、改写点在用、某个长锚点在用，或者还有别的
+    // checkpoint 引用着它，都要留着。释放顺序是从后往前摘锚点，这样被摘掉的不会影响还在的。
     if (source.endpoint_valid && source.execution_frontier > details.reuse_base) {
         const StateImageHandle endpoint = source.state.read;
         source.endpoint_valid           = false;
@@ -539,6 +583,10 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
         };
     }
 
+    // KV 侧的截断有两种形态，取决于新请求要怎么用这段前缀：走 CoW（prefix_fork）时源序列的页不动，
+    // 只把地址空间缩到 frontier；否则是破坏性截断，真把页交回去。破坏性截断前要先处理"尾页里超出
+    // frontier 的那半页"——如果 Host 上存着不同列数的旧副本，得先把它一并释放，否则 Host 与设备两侧
+    // 对同一页的记录会不一致。
     std::array<HostKVPageReplicaRelease, 2> host_tail_releases{};
     std::size_t host_tail_release_count = 0;
     for (TruncateTarget& target : std::span(targets.data(), target_count)) {
@@ -585,6 +633,8 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
         }
         target.addresses->set_checkpoint_requirement(target.address, target.frontier);
     }
+    // 三个后端各自的 KV 进度也要跟着退回 reuse_base：地址空间被截了，进度还停在原处就会让后续按
+    // "已经算过的位置"去读已经不存在的页。
     source.text_kv_valid = details.reuse_base;
     if (speculative_backend == SpeculativeBackend::Mtp) {
         source.mtp_kv_valid = backend_frontier_at(speculative_backend, details.reuse_base);
@@ -599,6 +649,13 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
     (void)checked_resource_difference(details.demand.final_removed, removed);
 }
 
+// 设备侧的准备：压力阶段已经收尾、牺牲者都已释放之后才进来。这里做三件事，顺序上互相嵌套——
+//   1) 状态镜像：按来源与复用路径决定"继承同一份（fork）"还是"另开一份（分配）"，其中 Host-only 的
+//      来源还要先把镜像搬回设备；所有设备槽位都是"先预订、再激活/搬运、最后结算或中止"。
+//   2) KV 地址空间：根请求新建一条，复用来源的则把来源的地址空间"激活"到本 lane；随后把激活前仍缺的
+//      设备页从 Host 副本补回来（记成恢复清单，交给后面的传输阶段真正拷贝）。
+//   3) 状态搬移：需要恢复的那一份状态在这里就发起到传输流上。
+// 走前缀 fork（CoW）的分支不在此列——它的目标是另一条地址空间，交给 prepare_prefix_forks。
 void ProgramImpl::prepare_materialization(MaterializationTransaction& transaction) {
     if (transaction.prepared || !transaction.plan ||
         transaction.destination.value >= max_concurrency ||
@@ -635,6 +692,8 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
     SharedPrefixState* shared_state = transaction.has_shared_source
                                           ? &shared_prefix_states[transaction.shared_source_index]
                                           : nullptr;
+    // state_count 是这次要给设备预留的状态槽数，直接取自候选当初承诺的量。下面几种情形会各自减一
+    // 并单独处理，因为它们的槽位有特殊来路（Host 恢复要占一格、fork 的目的地要另开、Both 分裂要一格）。
     std::uint32_t state_count       = demand.reservation_added.device.state_slots;
     std::optional<StateImageHandle> host_state_restore;
     std::optional<StateImageHandle> host_state_fork_destination;
@@ -644,22 +703,28 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
                 ? selected_state(*source_state, details.reuse, details.selected_checkpoint)
                 : shared_state->state;
         const StateReplicaResidency residency = state_store->residency(state);
-        // Source existence is a StateImageStore fact. Owner-exclusive resources may be zero for a
-        // valid allocation aliased by private and shared checkpoints.
+        // "来源存在"是 StateImageStore（镜像库）的事实，不看资源计数：一份合法分配可以被 private 与
+        // shared 两个检查点别名，此时它对任何一方都不是独占资源。
         if (state_store->role(state) != StateImageRole::CheckpointImmutable ||
             residency == StateReplicaResidency::None) {
             throw std::logic_error("materialization source has no published StateImage replica");
         }
+        // ConsumeToActive + 需要 fork：来源槽位马上就要变成本 lane 的活动状态，而镜像还得换一份新身份，
+        // 否则两条 lane 会共享同一份可变状态。
         const bool consuming_fork =
             source_state != nullptr &&
             details.source_mode == runtime::PrivateSourceMode::ConsumeToActive &&
             details.state_fork_required;
+        // 走法一：Host-only。设备上还没有这份镜像，得先把 Host 副本搬回来；搬运在函数末尾才发起，
+        // 这里先占掉一格预订并定好目的地。
         if (residency == StateReplicaResidency::HostOnly) {
             host_state_restore = state;
             if (state_count == 0) {
                 throw std::logic_error("Host StateImage restore has no Device reservation");
             }
             --state_count;
+            // Retain 与 consuming_fork 都是"本 lane 另拿一份身份"：Retain 留下原身份继续给来源用，
+            // consuming_fork 则是把来源身份整个接管过来。只预订逻辑身份——物理内容由 Host 副本补上。
             if (details.source_mode == runtime::PrivateSourceMode::Retain || consuming_fork) {
                 std::optional<StateImageHandle> destination =
                     state_store->reserve_logical_destination();
@@ -672,6 +737,8 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
                 host_state_fork_destination = *destination;
             }
         } else if (consuming_fork) {
+            // 走法二：镜像已在设备上且来源要被本 lane 接管——直接把来源镜像的身份 Fork 给本 lane，
+            // 免去一次设备内拷贝。
             if (state_count == 0) {
                 throw std::logic_error("StateImage Fork has no Device reservation");
             }
@@ -681,6 +748,8 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
         } else if (source_state != nullptr &&
                    details.source_mode == runtime::PrivateSourceMode::Retain &&
                    residency == StateReplicaResidency::Both) {
+            // 走法三：Both + Retain——来源同时有设备与 Host 两份副本，本 lane 只需要设备那一份，于是把
+            // 这次分配"分裂"成两个身份：来源继续持有 Host 副本，新身份持有设备副本，不额外拷贝。
             if (state_count == 0) {
                 throw std::logic_error("Both StateImage split has no active destination");
             }
@@ -692,6 +761,7 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
             transaction.split_state_identity                                = true;
         }
     }
+    // 剩下的槽位没有特殊来路，按需预订即可。reserved_states 的容量是构造期就切好的，这里只断言"没有超账"。
     if (state_count > transaction.reserved_states.size() - transaction.reserved_state_count) {
         throw std::logic_error("materialization state reservation exceeds the active contract");
     }
@@ -700,6 +770,8 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
         if (!state) { throw std::bad_alloc(); }
         transaction.reserved_states[transaction.reserved_state_count++] = *state;
     }
+    // 根请求（无任何来源）：镜像直接"激活为清零"，第一次前向从空状态开始。它的槽位在容量预留阶段就被
+    // 占定，必须是清单里的第一个。
     if (!transaction.has_source && !transaction.has_shared_source) {
         if (!transaction.root_continuation_index || transaction.root_waiting_for_victim ||
             continuation_slots[*transaction.root_continuation_index].role !=
@@ -710,8 +782,12 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
         state_store->activate_reset(transaction.reserved_states[0], device.stream);
     }
 
+    // 接下来是 KV 地址空间。地址空间描述符与其中的页是两回事：这里只决定"本 lane 用哪条地址空间、
+    // 要不要新建一条"，页级别的激活与补页在下面。
     KVAddressSpaceHandle text_address;
     std::optional<KVAddressSpaceHandle> backend_address;
+    // Retain 的来源仍需持有它原来的地址空间；ConsumeToActive 则是把来源那条整个交给本 lane（详见下面的
+    // activation）。
     const bool retained_source = (source_state != nullptr || shared_state != nullptr) &&
                                  details.source_mode == runtime::PrivateSourceMode::Retain;
     if (source_state != nullptr || shared_state != nullptr) {
@@ -723,6 +799,8 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
         }
         text_address    = source_kv->text;
         backend_address = source_kv->backend;
+        // 来源要保留（Retain）或要走前缀 fork 时，本 lane 需要一条新的、尚未激活的地址空间；否则直接
+        // 沿用来源那条（靠下面的 activation 把它挂到本 lane 名下）。
         if (retained_source || details.text_prefix_fork_required) {
             transaction.root_text_address = text_kv_addresses->create_inactive();
             if (!transaction.root_text_address) {
@@ -736,6 +814,7 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
             }
         }
     } else {
+        // 根请求：新建地址空间。它必须自带 Text KV，否则下面与 entitlement 的对账会失败。
         transaction.root_text_address = text_kv_addresses->create_inactive();
         if (!transaction.root_text_address) {
             throw std::logic_error("root Text KV address descriptor is unavailable");
@@ -757,6 +836,9 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
         throw std::logic_error("materialization KV addresses do not match their entitlements");
     }
 
+    // 激活的边界就是复用点 reuse_base：把地址空间里 0..frontier 这一段划给本 lane，边界内缺的设备页
+    // 之后再从 Host 副本补回来。后端 KV 的进度比 Text KV 差一格——MTP 在后端缓存里记的是"下一个"
+    // 位置。
     if (source_state != nullptr || shared_state != nullptr) {
         transaction.text_activation_frontier = details.reuse_base;
         if (backend_address) {
@@ -771,6 +853,9 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
         (source_state != nullptr || shared_state != nullptr) && details.text_prefix_fork_required;
     const bool backend_prefix_fork = (source_state != nullptr || shared_state != nullptr) &&
                                      details.backend_prefix_fork_required;
+    // 两条互斥的路：要走前缀 fork 的，本 lane 的目标是另一条地址空间，这里只留一个空页预订位，等
+    // prepare_prefix_forks 把尾页 CoW 完成后再填；不走 fork 的，直接对目标地址空间做 activation——
+    // 登记 lane 的活跃引用，并声明它允许持有多少设备页（entitlement）。
     if (text_prefix_fork) {
         transaction.text_source_restore_reservation.emplace(
             text_kv_pages->physical_pool().make_empty_reservation());
@@ -792,6 +877,8 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
             static_cast<std::int32_t>(lane), transaction.backend_activation_frontier));
     }
 
+    // 把激活边界内"设备上还缺的页"整理成一份恢复清单：只登记（逻辑页 → Host extent 里的副本位置 →
+    // 目标设备页句柄），真正的拷贝留给 enqueue_materialization_transfers。
     const auto prepare_kv_restores =
         [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages, KVAddressSpaceHandle address,
             std::optional<std::uint32_t> activation_frontier, bool source_reservation,
@@ -808,6 +895,7 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
             for (std::uint32_t page = 0; page < mapped; ++page) {
                 if (!pages.device_resident(addresses.logical_page(address, page))) { ++missing; }
             }
+            // fork 分支的空预订位在这里才长到实际缺口大小；activation 分支的预订位由地址空间自己持有。
             if (source_reservation) {
                 pages.physical_pool().resize_reservation(reservation, missing);
             }
@@ -845,6 +933,8 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
                             backend_restore_reservation, transaction.backend_restores,
                             transaction.backend_restore_destinations);
     }
+    // Host 镜像的搬回在这里真正发起到传输流上：目的地若是 fork 出来的新身份就走 host_fork（一份 Host
+    // 副本变成两份），否则是普通的 H2D。计时按 State 类记账，掩码留给后面的观测汇总。
     if (host_state_restore) {
         start_context_transfer_timer(runtime::ContextResourceClass::State);
         std::optional<StateImageTransfer> restore =
@@ -858,11 +948,21 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
         transaction.transfer_timer_mask |=
             1U << context_resource_index(runtime::ContextResourceClass::State);
     }
+    // 到这里"设备侧的预订"全部就位：镜像槽位、地址空间、恢复清单、状态搬移都已登记，只等传输阶段把它们
+    // 变成真实数据。prepared 之后本函数不会重入（上面已断言）。
     transaction.prepared = true;
     requests[lane].prefill->elapsed_seconds +=
         std::chrono::duration<double>(Clock::now() - prepare_started).count();
 }
 
+// 前缀 fork（写时复制）：来源地址空间原封不动，本 lane 新建一条地址空间，把 0..frontier 的**整页**
+// 共享过去（引用计数 +1 而已，不拷贝数据）；只有 frontier 落在页中间时，那一页尾页必须真复制一份，
+// 让两条地址空间各自持有——否则两边写同一页会互相污染。若计划还要求"留一份来源尾页的副本再释放来源
+// 的设备页"（retained tail release），要先把尾页备份到 Host（若尚无 Host 副本）。
+//
+// 这里把"发起的活"和"完成的活"分开：尾页复制是异步发到传输流上的，发完本函数就带着
+// prefix_tail_submitted 退出，等发布阶段同步、确认之后再回来收尾（置 prefix_forks_ready）。因此它从
+// 两个地方被调用——没有任何传输要发时（enqueue 的收尾），以及传输发布之后（publish 的收尾）。
 void ProgramImpl::prepare_prefix_forks(MaterializationTransaction& transaction) {
     if (!transaction.plan || transaction.plan->impl_ == nullptr ||
         (transaction.has_source == transaction.has_shared_source) ||
@@ -898,6 +998,8 @@ void ProgramImpl::prepare_prefix_forks(MaterializationTransaction& transaction) 
         transaction.backend_source_restore_reservation->pages() != 0) {
         throw std::logic_error("retained Backend KV restores are incomplete");
     }
+    // 要释放来源尾页的设备副本，就必须先保证它还有别的落脚点：没有 Host 副本的话，在这里为它预订一块
+    // Host extent（拷贝动作在发布阶段做）。同时确认这一页此刻确实只被本 fork 引用、没有别的写者。
     const auto prepare_retained_tail_backup = [&](KVAddressSpaceStore& addresses,
                                                   LogicalKVPageStore& pages,
                                                   KVPrefixForkReservation& fork, bool staged,
@@ -920,6 +1022,7 @@ void ProgramImpl::prepare_prefix_forks(MaterializationTransaction& transaction) 
         if (!reserved) { throw std::bad_alloc(); }
         backup.emplace(std::move(*reserved));
     };
+    // 预订位到此交棒：不再需要"从 Host 恢复来源页"，改由 fork 自己的预订承担本 lane 要新增的页。
     bool copied_tail = false;
     if (details.text_prefix_fork_required) {
         transaction.text_source_restore_reservation.reset();
@@ -932,6 +1035,7 @@ void ProgramImpl::prepare_prefix_forks(MaterializationTransaction& transaction) 
             *text_kv_addresses, *text_kv_pages, *transaction.text_prefix_fork,
             details.text_retained_tail_release, transaction.text_retained_tail,
             transaction.text_retained_tail_backup);
+        // 边界落在页中间：这一页要被两条地址空间同时引用，必须复制一份（写时复制的唯一一次真拷贝）。
         if (*transaction.text_activation_frontier % static_cast<std::uint32_t>(kPagedKVPageSize) !=
             0) {
             start_context_transfer_timer(runtime::ContextResourceClass::MainKV);
@@ -964,6 +1068,7 @@ void ProgramImpl::prepare_prefix_forks(MaterializationTransaction& transaction) 
             *backend_kv_addresses, *backend_kv_pages, *transaction.backend_prefix_fork,
             details.backend_retained_tail_release, transaction.backend_retained_tail,
             transaction.backend_retained_tail_backup);
+        // 后端 KV 同理：尾页在页中间时也要复制一份。
         if (*transaction.backend_activation_frontier %
                 static_cast<std::uint32_t>(kPagedKVPageSize) !=
             0) {
@@ -981,6 +1086,8 @@ void ProgramImpl::prepare_prefix_forks(MaterializationTransaction& transaction) 
         }
     }
 
+    // 尾页复制是异步的：登记一个完成点，并把本事务标成"传输未结算"，进度机下一轮会先把它同步掉、发布，
+    // 再回到这里走后半段（备份/释放尾页）。没有拷贝可发时就直接宣布前缀就绪。
     if (copied_tail) {
         context_completion_.record(device.transfer_stream);
         transaction.prefix_tail_submitted = true;
@@ -990,6 +1097,9 @@ void ProgramImpl::prepare_prefix_forks(MaterializationTransaction& transaction) 
     }
 }
 
+// 把 prepare_materialization 登记好的恢复清单真正发到传输流上（KV 的 H2D 补页；状态的 Host 搬回在
+// prepare 阶段就发过了）。相邻且在同一 Host extent 里连续的页会被合并成一次拷贝——这是纯粹的批处理。
+// 发完登记完成点；一张拷贝都没发时，说明本事务的活只剩前缀 fork，直接转交给 prepare_prefix_forks。
 void ProgramImpl::enqueue_materialization_transfers(MaterializationTransaction& transaction) {
     if (!transaction.prepared || transaction.transfer_submitted) {
         throw std::logic_error("materialization transfer batch is not enqueueable");
@@ -1004,6 +1114,7 @@ void ProgramImpl::enqueue_materialization_transfers(MaterializationTransaction& 
             }
             if (restores.empty()) { return; }
             start_context_transfer_timer(resource);
+            // 把 Host extent 里位置连续的相邻页并成一段，逐段投递。
             std::size_t begin = 0;
             while (begin < restores.size()) {
                 std::size_t end = begin + 1;
@@ -1031,6 +1142,7 @@ void ProgramImpl::enqueue_materialization_transfers(MaterializationTransaction& 
                    transaction.backend_restore_destinations,
                    runtime::ContextResourceClass::BackendKV);
     }
+    // 有拷贝在飞才需要登记完成点；一张都没有（或只剩前缀 fork）就直接进入下一步。
     const bool any = transaction.state_restore.has_value() || !transaction.text_restores.empty() ||
                      !transaction.backend_restores.empty();
     if (any) {
@@ -1043,6 +1155,9 @@ void ProgramImpl::enqueue_materialization_transfers(MaterializationTransaction& 
     }
 }
 
+// 传输完成后补记观测：计时器已经在发起拷贝时开关过，这里把"哪一类资源、哪个方向、多大工作量、多少页"
+// 汇总成对外的观测行。掩码保证每一类资源只记一次；各分支按本事务实际做过的事（尾页 CoW / 尾页备份 /
+// 恢复搬运）挑对应的方向与工作量模型。
 void ProgramImpl::record_materialization_transfer_observations(
     MaterializationTransaction& transaction) {
     if (!transaction.transfer_submitted || !context_completion_.ready()) {
@@ -1130,8 +1245,13 @@ void ProgramImpl::record_materialization_transfer_observations(
     }
 }
 
+// 传输完成后的"落定"。它本身也是分段的：每处理完一段，可能又发起新的传输（尾页 CoW 之后的备份），
+// 于是带着 transfer_submitted 退出，等下一轮再进来接着做。顺序是——
+//   尾页 CoW 已提交 → 备份尾页到 Host（若有需要）→ 发布备份并释放来源尾页 → 前缀就绪；
+//   否则 → 发布状态镜像与 KV 恢复页（预订变正式）→ 若还要前缀 fork 就转交 prepare_prefix_forks。
 void ProgramImpl::publish_materialization_transfers(MaterializationTransaction& transaction) {
     record_materialization_transfer_observations(transaction);
+    // 尾页备份：把设备上的尾页拷进预先订好的 Host extent。这一段同样是"发完就退出"。
     const auto enqueue_retained_tail_backups = [&]() {
         bool submitted     = false;
         const auto enqueue = [&](LogicalKVPageStore& pages,
@@ -1163,6 +1283,8 @@ void ProgramImpl::publish_materialization_transfers(MaterializationTransaction& 
         }
         return submitted;
     };
+    // 来源尾页的最终处置：备份先落进 Host extent，来源页的引用关系结算完，才允许丢掉它的设备副本。
+    // 顺序不能颠倒——先释放设备页再发布备份，中间任何失败都会丢掉数据。
     const auto publish_retained_tail_releases = [&]() {
         if (!transaction.plan || transaction.plan->impl_ == nullptr) {
             throw std::logic_error("retained KV tail release lost its admission plan");
@@ -1210,6 +1332,7 @@ void ProgramImpl::publish_materialization_transfers(MaterializationTransaction& 
         }
         transaction.prefix_forks_ready = true;
     };
+    // 尾页 CoW 已同步：接着要么去备份尾页（新一段传输），要么直接做尾页释放收尾。
     if (transaction.prefix_tail_submitted) {
         transaction.prefix_tail_submitted = false;
         transaction.transfer_submitted    = false;
@@ -1223,11 +1346,14 @@ void ProgramImpl::publish_materialization_transfers(MaterializationTransaction& 
         publish_retained_tail_releases();
         return;
     }
+    // 常规路径：状态镜像与 KV 恢复页从"预订"转为"已发布"。状态搬运在 prepare 阶段就发起了，这里只是
+    // 承认它；第二个参数 true = 保留来源侧的副本，也就是搬回设备之后 Host 上那份检查点继续留着。
     if (transaction.state_restore) {
         state_store->publish_transfer(std::move(*transaction.state_restore), true);
         transaction.state_restore.reset();
         transaction.state_restored = true;
     }
+    // 恢复页同样在这里转正式：发布之后它们才算"设备上有一份可用的副本"，此前只是预订+拷贝。
     for (const MaterializationTransaction::KVRestorePage& restore : transaction.text_restores) {
         text_kv_pages->publish_device_replica(restore.logical);
     }
@@ -1246,6 +1372,9 @@ void ProgramImpl::publish_materialization_transfers(MaterializationTransaction& 
     }
 }
 
+// 传输阶段的撤销。此刻可能还有拷贝在飞——先把传输流同步干净（不留下写了一半的页），把已经发生的传输补
+// 记成观测，再把所有**尚未发布**的目标退回：状态搬运中止，KV 恢复页交还预订位。已经发布的东西不能撤，
+// 所以这里只处理"还在预订态"的对象；任何一步失败都是逻辑错误，直接 terminate。
 void ProgramImpl::abort_materialization_transfers(
     MaterializationTransaction& transaction) noexcept {
     try {
@@ -1253,10 +1382,12 @@ void ProgramImpl::abort_materialization_transfers(
             context_completion_.synchronize();
             record_materialization_transfer_observations(transaction);
         }
+        // 状态搬运的中止由镜像库自己保证：它知道这次搬运占据的是哪一格。
         if (transaction.state_restore) {
             state_store->abort_transfer(std::move(*transaction.state_restore));
             transaction.state_restore.reset();
         }
+        // 恢复页的预订位就藏在"激活"或 fork 的预订位里，取出来按行退回。
         if (transaction.text_activation || transaction.text_source_restore_reservation) {
             DeviceKVPageReservation& reservation =
                 transaction.text_source_restore_reservation
@@ -1278,6 +1409,7 @@ void ProgramImpl::abort_materialization_transfers(
             }
         }
     } catch (...) { std::terminate(); }
+    // 清单清空、计时掩码归零：本事务此后不再有传输阶段，观测也已经补记过了。
     transaction.text_restores.clear();
     transaction.text_restore_destinations.clear();
     transaction.backend_restores.clear();
@@ -1286,6 +1418,9 @@ void ProgramImpl::abort_materialization_transfers(
     transaction.transfer_submitted  = false;
 }
 
+// 压力工作的"建账"：把计划里早已定好的动作（owner 选择出的每一条）翻译成本次事务的私有记账行。
+// 这里不碰任何物理资源，只做两件事——把页区间展开成具体的逻辑页句柄，并校验区间确实落在该地址空间内。
+// 纯驱逐（evicts_continuation）不需要这份账：它整条 owner 一起走，没有按页的搬运。
 void ProgramImpl::prepare_pressure_bookkeeping(MaterializationTransaction::PressureWork& work) {
     work.state_changes.clear();
     work.main_kv_changes.clear();
@@ -1327,6 +1462,8 @@ void ProgramImpl::prepare_pressure_bookkeeping(MaterializationTransaction::Press
                     change.pages.push_back(
                         addresses->logical_page(*address, action.begin_page + offset));
                 }
+                // DemoteToHost 要往 Host 搬，提前把"设备侧来源页句柄"的位置留好（真正的来源在准备
+                // 传输时由 Host extent 预订结果填进 change.sources）。
                 if (action.kind == qwen3_5::detail::PressureKVDecisionKind::DemoteToHost) {
                     change.sources.resize(action.page_count);
                 }
@@ -1338,6 +1475,9 @@ void ProgramImpl::prepare_pressure_bookkeeping(MaterializationTransaction::Press
             work.option.backend_kv_changes, work.backend_kv_changes);
 }
 
+// 第一阶段的落地：只做"删了不用搬"的那部分动作——丢 Host 副本、丢检查点。它们不依赖任何拷贝，所以
+// 在拷贝开始之前就能提交；也正因如此，事务中途取消时这部分已经生效、不再回滚（见 progress 里的取消
+// 说明）。记账只累加到 committed_delta，最终还要和计划承诺的 effect 对账。
 void ProgramImpl::publish_pressure_host_releases(MaterializationTransaction::PressureWork& work) {
     detail::PhysicalDelta delta;
     if (work.option.evicts_continuation || work.completed || work.submitted) { return; }
@@ -1361,6 +1501,7 @@ void ProgramImpl::publish_pressure_host_releases(MaterializationTransaction::Pre
     SharedPrefixState* shared =
         work.shared_owner ? &shared_prefix_states[work.continuation_index] : nullptr;
 
+    // 丢检查点只对私有（continuation）owner 成立：共享前缀的检查点不属于任何单条请求。
     if (!work.option.dropped_checkpoints.empty() && !work.checkpoint_drop_published) {
         if (sequence == nullptr) {
             throw std::logic_error("checkpoint drop targets a shared pressure owner");
@@ -1461,6 +1602,10 @@ void ProgramImpl::publish_pressure_host_releases(MaterializationTransaction::Pre
     work.committed_delta.added = checked_resource_sum(work.committed_delta.added, delta.added);
 }
 
+// 第二阶段：把"要搬运"的动作变成真正的拷贝。进度机按资源类分三轮调用它（State → MainKV →
+// BackendKV），每次只处理 resource 这一类；这样计时与观测天然按类分开。每轮都要重新校验 owner 与
+// 页区间——上一轮的删除可能已经改变了世界。DemoteToHost 在这里预订 Host extent 并发出 D2H 拷贝；
+// 两类 Drop 只做校验，真正的删除留到发布阶段，以保证"数据先有落脚点，再删原件"。
 void ProgramImpl::prepare_pressure_work(MaterializationTransaction::PressureWork& work,
                                         runtime::ContextResourceClass resource) {
     const bool valid_owner =
@@ -1486,6 +1631,7 @@ void ProgramImpl::prepare_pressure_work(MaterializationTransaction::PressureWork
     if (work.state_changes.size() != work.option.state_changes.size()) {
         throw std::logic_error("pressure State bookkeeping is not action aligned");
     }
+    // State 类：按动作发起 D2H 搬运（每个动作最多一份状态镜像）。
     if (resource == runtime::ContextResourceClass::State) {
         for (std::size_t index = 0; index < work.option.state_changes.size(); ++index) {
             const qwen3_5::detail::PressureStateDecision action = work.option.state_changes[index];
@@ -1524,6 +1670,8 @@ void ProgramImpl::prepare_pressure_work(MaterializationTransaction::PressureWork
         for (std::uint32_t offset = 0; offset < action.page_count; ++offset) {
             const LogicalKVPageHandle logical =
                 addresses.logical_page(address, action.begin_page + offset);
+            // 动作本身规定了当前应有的副本状态：DemoteToHost 只对"设备有、Host 没有"的页有意义；
+            // 两类 Drop 则要求 Host 副本已经存在（要删的东西得先在那里）。
             const bool host_resident = pages.host_resident(logical);
             const bool valid_residency =
                 action.kind == qwen3_5::detail::PressureKVDecisionKind::DemoteToHost
@@ -1548,6 +1696,7 @@ void ProgramImpl::prepare_pressure_work(MaterializationTransaction::PressureWork
             return;
         }
         if (action.kind == qwen3_5::detail::PressureKVDecisionKind::DropDeviceDuplicate) { return; }
+        // 剩下的就是 DemoteToHost：先订好 Host 落脚点，再把每一页的设备来源拷过去。
         if (!host_kv_extents) { throw std::logic_error("Host KV extent store is unavailable"); }
         std::optional<HostKVExtentReservation> reserved =
             host_kv_extents->prepare(pages, change.pages);
@@ -1585,6 +1734,7 @@ void ProgramImpl::prepare_pressure_work(MaterializationTransaction::PressureWork
                        work.option.backend_kv_changes[index], work.backend_kv_changes[index]);
         }
     }
+    // 本轮有没有真的发出东西：有则事务要等完成点，进度机会停在"拷贝在飞"。
     work.submitted = std::any_of(work.state_changes.begin(), work.state_changes.end(),
                                  [](const auto& change) { return change.transfer.has_value(); }) ||
                      std::any_of(work.main_kv_changes.begin(), work.main_kv_changes.end(),
@@ -1593,6 +1743,9 @@ void ProgramImpl::prepare_pressure_work(MaterializationTransaction::PressureWork
                                  [](const auto& change) { return change.backup.has_value(); });
 }
 
+// 第三阶段：把拷贝出来的副本与随后的删除一起落定。顺序仍然是"先有落脚点，再删原件"——备份先进
+// Host extent，再丢设备副本。这里是 noexcept + terminate 的收尾路径：走到这一步前面的准备都成功了，
+// 剩下的失败意味着账本已经和物理世界对不上，继续跑没有意义。
 void ProgramImpl::publish_pressure_work(MaterializationTransaction::PressureWork& work) noexcept {
     try {
         if (work.option.evicts_continuation || work.completed) { std::terminate(); }
@@ -1607,11 +1760,14 @@ void ProgramImpl::publish_pressure_work(MaterializationTransaction::PressureWork
             const std::optional<StateImageHandle> source =
                 pressure_state_source(action, sequence, shared);
             if (!source) { std::terminate(); }
+            // 搬出去的（DemoteToHost）在此转为"Host 侧持有"：第二个参数 false = 不留来源副本，即设备侧
+            // 那一份随发布一起交出。
             if (change.transfer) {
                 state_store->publish_transfer(std::move(*change.transfer), false);
                 change.transfer.reset();
                 work.mutation_published = true;
             } else if (!change.host_released) {
+                // 没搬过、纯删副本的动作：按方向决定删 Host 还是删设备那一份。
                 if (pressure_state_drops_host(action)
                         ? !state_store->drop_host_replica(*source)
                         : !state_store->drop_device_replica(*source)) {
@@ -1624,6 +1780,7 @@ void ProgramImpl::publish_pressure_work(MaterializationTransaction::PressureWork
         const auto publish_kv =
             [&](LogicalKVPageStore& pages, const qwen3_5::detail::PressureKVDecision& action,
                 MaterializationTransaction::PressureWork::KVChangeWork& change) {
+                // DropHostDuplicate 不搬运，所以不该持有备份；直接释放 Host 副本。
                 if (action.kind == qwen3_5::detail::PressureKVDecisionKind::DropHostDuplicate) {
                     if (change.host_released) { return; }
                     if (!host_kv_extents || change.backup) { std::terminate(); }
@@ -1633,6 +1790,7 @@ void ProgramImpl::publish_pressure_work(MaterializationTransaction::PressureWork
                     work.mutation_published = true;
                     return;
                 }
+                // 先把落脚点（Host extent）转正，再丢设备副本。
                 if (change.backup) {
                     if (!host_kv_extents) { std::terminate(); }
                     (void)host_kv_extents->publish(std::move(*change.backup));
@@ -1647,6 +1805,7 @@ void ProgramImpl::publish_pressure_work(MaterializationTransaction::PressureWork
             work.backend_kv_changes.size() != work.option.backend_kv_changes.size()) {
             std::terminate();
         }
+        // spill_pages 只统计真正降级（DemoteToHost）的页数，供对外操作计数用；两类 Drop 不计。
         for (std::size_t index = 0; index < work.option.main_kv_changes.size(); ++index) {
             publish_kv(*text_kv_pages, work.option.main_kv_changes[index],
                        work.main_kv_changes[index]);
@@ -1671,6 +1830,8 @@ void ProgramImpl::publish_pressure_work(MaterializationTransaction::PressureWork
     } catch (...) { std::terminate(); }
 }
 
+// 压力工作的撤销：与其它撤销一样，只退"还没提交的东西"——搬运中的状态镜像交还，Host extent 预订位
+// 释放（预订本身就是临时的），已经提交给 HostReleases 阶段的删除不回滚。
 void ProgramImpl::abort_pressure_work(MaterializationTransaction::PressureWork& work) noexcept {
     try {
         if (work.completed) { return; }
@@ -1689,6 +1850,9 @@ void ProgramImpl::abort_pressure_work(MaterializationTransaction::PressureWork& 
     } catch (...) { std::terminate(); }
 }
 
+// 整条驱逐一个私有牺牲者。它不是原子的：槽位身份（索引+代际）可能在这期间变了，那就什么都不做，
+// 返回空结果让调用方按"已经不由我们负责"处理。唯一特殊的一处是根请求自己的槽位——如果这条正是它
+// 等的那个，释放之后要立刻改回 ReservedMaterialization，把它交还给正在等待的根事务。
 ProgramImpl::PhysicalReleaseResult
 ProgramImpl::release_materialization_victim(MaterializationTransaction& transaction,
                                             std::size_t position) {
@@ -1718,6 +1882,18 @@ ProgramImpl::release_materialization_victim(MaterializationTransaction& transact
     return out;
 }
 
+// 物化事务的推进机：Runtime 反复调用它，每一轮都推进到下一个"稳定点"就返回（要么 InProgress，要么
+// 终态）。整条流水线是四段串起来的，顺序不能换：
+//   1) 压力阶段（五相：HostReleases → CopyPreparation → CopiesInFlight → CopyPublication → Committed）。
+//      先删不搬的（Host 副本/检查点），再按资源类发起 D2H 降级拷回，等拷贝落地后才真正删设备副本，
+//      最后把一份份 work 的结果汇总成对外的回执。
+//   2) 来源收尾 prepare_consumed_source：退 KV 进度、截断来源地址空间。
+//   3) 传输阶段：发起恢复搬运、等完成、发布（预订转正）。
+//   4) 设备侧准备 prepare_materialization + enqueue，最后 start_request —— 全流程唯一的物理发布点。
+//
+// 不可抢占：取消只在**阶段边界**被检查。已经提交的物理删除不回滚（也回滚不了），所以取消检查一律
+// 紧跟在"一个阶段刚刚完成"之后，且此后不再发起新的阶段。中止时必须补齐所有回执——Runtime 依赖它们
+// 归还逻辑目录能力。
 MaterializationResult
 ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView cancellation) {
     MaterializationResult out;
@@ -1728,6 +1904,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
     }
     MaterializationTransaction& transaction = *transaction_ptr;
     PressureTransition& pressure_transition = transaction.pressure_transition;
+    // 把各 work 的降级页数汇总到事务级计数，并就地归零（同一份 work 不会被统计两次）。饱和加法：
+    // 计数溢出不值得让事务失败。
     const auto collect_pressure_operations  = [&](MaterializationTransaction::PressureWork& work) {
         if (work.spill_pages > std::numeric_limits<std::uint64_t>::max() -
                                    transaction.operations.pressure_spill_pages) {
@@ -1737,6 +1915,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         }
         work.spill_pages = 0;
     };
+    // 回执的两种形态。Retain(保留)：这个 owner 还在目录里，回执要带上它的最新摘要（模式/处置写清楚是"保留"）。
     const auto retain_private_result = [&](auto& result, const SequenceState& state) {
         if (!result.final_summary) {
             throw std::logic_error("private acknowledgement backing was not reserved");
@@ -1749,11 +1928,14 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         }
         populate_continuation_summary(state, *result.final_summary);
     };
+    // Evicted(驱逐)：整个 owner 已经不在目录里，摘要没有意义，只留"已经提交"的标记。
     const auto evict_private_result = [&](MaterializationVictimResult& result) {
         result.disposition        = runtime::VictimDisposition::Evicted;
         result.pressure_committed = true;
         result.final_summary.reset();
     };
+    // 牺牲者的回执：走到这里仍未被"物理释放"的（例如只压了它的 Host 副本，槽位还在目录里），要按
+    // "保留"出具摘要；pressure_committed 直接取该 work 有没有真的动过物理资源。
     const auto complete_victim_acknowledgement = [&]() {
         for (std::size_t position = 0; position < transaction.victim_count; ++position) {
             if (transaction.victim_released[position]) { continue; }
@@ -1771,6 +1953,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         }
         out.victims = std::move(transaction.pressure_results);
     };
+    // 私有来源的两种归途：ConsumeToActive 且已发布时，来源槽位已经变成这条 lane 的活动状态，本事务
+    // 不再对外出具来源回执；否则来源必须仍然在目录里（身份未变），并带上最新摘要作为保留凭据。
     const auto complete_source_acknowledgement = [&](bool published) {
         if (!transaction.has_source) { return; }
         if (published && transaction.source_mode == runtime::PrivateSourceMode::ConsumeToActive) {
@@ -1807,6 +1991,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         }
         transaction.shared_source_result->final_summary = shared_prefix_summary(source);
         out.shared_source.emplace(std::move(*transaction.shared_source_result));
+        // 共享来源不会因本事务消失，它至少还被本 lane 引用着——引用数归零说明账错了。
         if (published && out.shared_source->final_summary->active_references == 0) {
             throw std::logic_error("published shared source lost its active reference");
         }
@@ -1830,6 +2015,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         }
         out.shared_victims = std::move(transaction.shared_pressure_results);
     };
+    // 中止：先把暂存（预订、拷贝）退掉，再标记终态，最后补齐所有的回执——即使这一趟什么都没做成，
+    // Runtime 也必须有完整的凭据去归还逻辑目录能力。
     const auto abort_transaction = [&]() {
         release_materialization_staging(transaction);
         transaction.terminal      = true;
@@ -1844,6 +2031,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
 
     if (cancellation.requested()) { transaction.cancel_pending = true; }
 
+    // 第一相：只做"删了不用搬"的部分。共享牺牲者（前缀目录里的）先走，私有牺牲者随后。
     if (pressure_transition.phase == PressureTransitionPhase::HostReleases) {
         if (transaction.cancel_pending) {
             abort_transaction();
@@ -1851,6 +2039,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         }
         for (std::size_t position = 0; position < transaction.shared_victim_count; ++position) {
             MaterializationTransaction::PressureWork& work = transaction.shared_pressure[position];
+            // 纯驱逐：整条 owner 一次性放掉（严格释放，不做任何隐式丢弃），并要求计划当初承诺的
+            // "只减不增"仍然成立。
             if (work.option.evicts_continuation) {
                 const std::uint32_t index      = transaction.shared_victim_indices[position];
                 const std::uint64_t generation = transaction.shared_victim_generations[position];
@@ -1886,6 +2076,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                 publish_pressure_host_releases(work);
             }
         }
+        // 私有牺牲者同理：要么整条驱逐，要么只发布不搬运的 Host 侧删除。
         for (std::size_t position = 0; position < transaction.victim_count; ++position) {
             MaterializationTransaction::PressureWork& work = transaction.pressure[position];
             if (work.option.evicts_continuation) {
@@ -1910,6 +2101,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                 }
             }
         }
+        // 阶段边界。上面这些删除已经提交、无法回滚，因此从这里开始取消是"干净"的——后面还没有发起
+        // 任何拷贝。取消检查一律照这个模式放在阶段收尾处。
         pressure_transition.phase = PressureTransitionPhase::CopyPreparation;
         if (cancellation.requested()) { transaction.cancel_pending = true; }
         if (transaction.cancel_pending) {
@@ -1918,12 +2111,15 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         }
     }
 
+    // 对账：实际减去/增加的量必须与计划当初承诺的一致（不一致说明账错了）。随后把 work 的记账直接记成
+    // 承诺值，后续所有对账都以计划为准。
     const auto complete_pressure_delta = [&](MaterializationTransaction::PressureWork& work) {
         (void)checked_resource_difference(work.option.effect.removed, work.committed_delta.removed);
         (void)checked_resource_difference(work.option.effect.added, work.committed_delta.added);
         work.committed_delta = work.option.effect;
     };
 
+    // 还没走完的 work：共享的在前，私有的在后（与发起顺序一致）。
     const auto for_each_pending_pressure = [&](auto&& callback) {
         for (MaterializationTransaction::PressureWork& work : transaction.shared_pressure) {
             if (!work.completed) { callback(work); }
@@ -1933,6 +2129,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         }
     };
 
+    // 第二相：发起降级拷贝。按资源类分三轮（State → MainKV → BackendKV），顺序固定——计时与观测都
+    // 按这个次序切分。某一类完全没有 D2H 需求时不开计时器，也就不会产生观测行。
     if (pressure_transition.phase == PressureTransitionPhase::CopyPreparation) {
         if (transaction.cancel_pending) {
             abort_transaction();
@@ -2015,6 +2213,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                     });
             }
         } catch (...) {
+            // 失败时可能已经有拷贝在飞：先把流同步干净，再逐个退回，然后原样抛出（由上层决定事务去留）。
             (void)cudaStreamSynchronize(device.transfer_stream);
             for_each_pending_pressure(
                 [&](MaterializationTransaction::PressureWork& work) { abort_pressure_work(work); });
@@ -2025,6 +2224,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         for_each_pending_pressure([&](const MaterializationTransaction::PressureWork& work) {
             copies_submitted = copies_submitted || work.submitted;
         });
+        // 有东西在飞就停在等完成点；什么都没发就直接进入发布。
         pressure_transition.phase = copies_submitted ? PressureTransitionPhase::CopiesInFlight
                                                      : PressureTransitionPhase::CopyPublication;
         if (copies_submitted) {
@@ -2034,6 +2234,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         }
     }
 
+    // 第三相：只等完成点，不做任何事。
     if (pressure_transition.phase == PressureTransitionPhase::CopiesInFlight) {
         if (!context_completion_.ready()) {
             out.status = runtime::ContextTransactionStatus::InProgress;
@@ -2042,12 +2243,14 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         pressure_transition.phase = PressureTransitionPhase::CopyPublication;
     }
     if (transaction.cancel_pending) {
-        // D2H destinations are still private reservations.  Waiting for the stream and aborting
-        // them leaves only the already committed PreRelease changes visible.
+        // 此刻 D2H 的目的地仍然是私有预订。等流同步、把这些预订退掉之后，外部能看到的只有
+        // HostReleases 那一相已经提交的删除。
         abort_transaction();
         return out;
     }
 
+    // 第四相：拷贝已经落地，这才真正删掉设备副本，并给每个 work 出回执。共享的在前，私有的在后，
+    // 游标在最后才推进到末尾——中途抛异常时剩下的 work 仍然"未完成"，可被撤销路径统一处理。
     if (pressure_transition.phase == PressureTransitionPhase::CopyPublication) {
         for (std::size_t position = 0; position < transaction.shared_pressure.size(); ++position) {
             MaterializationTransaction::PressureWork& work = transaction.shared_pressure[position];
@@ -2084,6 +2287,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
             runtime::ContextResourceClass::MainKV,
             runtime::ContextResourceClass::BackendKV,
         };
+        // 把压力阶段的计时按类转成对外观测行（方向固定是 D2H）。
         for (const runtime::ContextResourceClass resource : pressure_resources) {
             const std::size_t index = context_resource_index(resource);
             const std::uint8_t bit  = static_cast<std::uint8_t>(1U << index);
@@ -2105,6 +2309,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         throw std::logic_error("materialization pressure transition did not reach a stable phase");
     }
 
+    // 压力阶段整体提交之后，才收尾来源：退 KV 进度、截断来源地址空间。它必须排在压力之后——被压掉
+    // 的空间正是来源可以收缩的前提。
     if (!transaction.source_prepared) {
         prepare_consumed_source(transaction);
         if (cancellation.requested()) { transaction.cancel_pending = true; }
@@ -2114,6 +2320,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         }
     }
 
+    // 传输阶段：等完成点 → 发布。发布本身可能又发起新传输（尾页备份），所以发布后还要再看一眼。
     if (transaction.transfer_submitted) {
         if (!context_completion_.ready()) {
             out.status = runtime::ContextTransactionStatus::InProgress;
@@ -2135,6 +2342,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         return out;
     }
 
+    // 设备侧准备 + 发起拷贝：这一对是紧挨着的（准备只登记预订，紧接着就把拷贝发出去）。
     if (!transaction.prepared) {
         prepare_materialization(transaction);
         enqueue_materialization_transfers(transaction);
@@ -2148,8 +2356,9 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         return out;
     }
 
-    // This is the unique physical publication point. ResourceManager still owns the logical
-    // catalog capabilities and adopts them only after validating this terminal result.
+    // 全流程唯一的物理发布点。走到这里所有物理资源都已就位，start_request 把它们交给 lane 正式执行；
+    // 逻辑目录能力仍归 ResourceManager，它要在这份终态结果校验通过之后才会认领。发布失败则把暂存退掉，
+    // 让事务保持"未提交"。
     try {
         out.published.emplace(start_request(transaction));
         materialization_ledger_.clear();
@@ -2170,6 +2379,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
     return out;
 }
 
+// 对外只有这一个推进入口：按 context_transaction_ 当前握着哪种事务分发。两种事务的实现是同构的——都
+// 是自己内部的相位机，都只返回"进行中"或终态；这里统一把非法状态挡在门外。
 ContextTransactionProgress
 ProgramImpl::progress_context_transaction(runtime::CancellationFlagView cancellation) {
     const auto terminal_or_pending =
@@ -2197,6 +2408,8 @@ ProgramImpl::progress_context_transaction(runtime::CancellationFlagView cancella
         context_transaction_);
 }
 
+// 终态事务在推进之后才被回收：先在这里确认它确实到了终态，再把它从 variant 里卸掉。回收之所以不能由
+// 推进函数自己做，是因为调用方还没读走结果。
 void ProgramImpl::finalize_context_transaction() noexcept {
     const bool terminal = std::visit(
         [](const auto& transaction) {
@@ -2213,6 +2426,7 @@ void ProgramImpl::finalize_context_transaction() noexcept {
     if (terminal) { context_transaction_.emplace<std::monostate>(); }
 }
 
+// 是否已有未终结的事务：一个新事务想要开始，前提是这里为 false。
 bool ProgramImpl::has_context_transaction() const noexcept {
     return !std::holds_alternative<std::monostate>(context_transaction_);
 }
